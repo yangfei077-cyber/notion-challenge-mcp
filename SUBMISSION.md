@@ -2,41 +2,40 @@
 
 ## Title
 
-I built a Notion MCP server that turns Notion into an agent-friendly team OS
+I built a Founder OS on top of Notion MCP that decides what startup ideas are worth building
 
 ## Pitch
 
-For the Notion challenge, I wanted something more practical than a thin wrapper around the API. I built a local MCP server that gives agents a curated set of high-value Notion tools:
+For the Notion challenge, I wanted to build something more opinionated than a generic wrapper. I turned Notion into a Founder OS:
 
-- search the workspace
-- inspect pages and block trees
-- create structured pages from markdown
-- bootstrap a task database
-- add tasks with status and priority
-- generate a daily brief page for execution
+- a founder records an idea
+- an agent researches competitors and substitutes
+- the agent judges risk and upside
+- the agent generates an execution checklist
+- the result lands in a Notion idea pipeline and a founder memo page
 
-The result is a lightweight "team operating system" where Notion becomes both the source of truth and the action surface for an AI agent.
+The result is a workflow where Notion becomes the system of record for deciding what to build, what to validate, and what to ignore.
 
 ## What makes it interesting
 
 - It is usable right away with any MCP-capable client.
-- It focuses on workflows instead of low-level transport details.
-- It demonstrates a clear agent loop: read state from Notion, decide, then write structured updates back into Notion.
+- It focuses on startup decision-making instead of low-level API plumbing.
+- It demonstrates a clear agent loop: research outside, judge, then write structured output back into Notion.
 
 ## How it works
 
-- The MCP server runs over stdio.
+- The MCP server runs over stdio and Streamable HTTP.
 - It authenticates with a standard Notion integration token.
 - It uses the latest Notion API version available during the challenge build: `2026-03-11`.
-- It exposes reusable tools for search, page creation, block append, task-system setup, task creation, and daily brief generation.
+- It exposes startup-specific tools like `founder_create_idea_pipeline`, `founder_capture_idea`, and `founder_write_founder_memo`.
 
 ## Demo idea
 
 1. Point the server at a shared project page.
-2. Ask the agent to create a task database.
-3. Ask it to add tasks from a rough meeting summary.
-4. Ask it to generate the day's brief with priorities and blockers.
-5. Ask it to append end-of-day notes back into the workspace.
+2. Ask the agent to create the Founder OS idea pipeline.
+3. Give the agent a startup idea and have it research competitor signals.
+4. Ask it to judge the main risks and generate an execution checklist.
+5. Have it write the result into the pipeline and a founder memo page.
 
 ## Repo note
 

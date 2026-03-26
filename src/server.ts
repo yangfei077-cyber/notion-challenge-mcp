@@ -182,6 +182,46 @@ function statusProperty(value: string) {
   } satisfies NonNullable<CreatePageParameters["properties"]>[string];
 }
 
+function textSection(title: string, body: string | undefined, fallback: string): string[] {
+  return [title, body?.trim() || fallback];
+}
+
+function bulletSection(title: string, items: string[], fallback: string): string[] {
+  return [title, ...(items.length > 0 ? items.map((item) => `- ${item}`) : [`- ${fallback}`])];
+}
+
+function numberedSection(title: string, items: string[], fallback: string): string[] {
+  return [title, ...(items.length > 0 ? items.map((item, index) => `${index + 1}. ${item}`) : [`1. ${fallback}`])];
+}
+
+function buildFounderMemoMarkdown(input: {
+  ideaTitle: string;
+  oneLinePitch?: string;
+  problem?: string;
+  targetUser?: string;
+  differentiators: string[];
+  competitors: string[];
+  risks: string[];
+  evidence: string[];
+  executionChecklist: string[];
+  verdictSummary?: string;
+  nextStep?: string;
+}) {
+  return [
+    `# Founder Memo: ${input.ideaTitle}`,
+    ...textSection("## One-line pitch", input.oneLinePitch, "No one-line pitch captured yet."),
+    ...textSection("## Problem", input.problem, "No problem statement captured yet."),
+    ...textSection("## Target user", input.targetUser, "No target user captured yet."),
+    ...bulletSection("## Differentiators", input.differentiators, "No differentiators yet."),
+    ...bulletSection("## Competitor signals", input.competitors, "No competitors recorded yet."),
+    ...bulletSection("## Risk flags", input.risks, "No risks recorded yet."),
+    ...bulletSection("## Evidence", input.evidence, "No evidence recorded yet."),
+    ...numberedSection("## Execution checklist", input.executionChecklist, "Define the first execution step."),
+    ...textSection("## Verdict", input.verdictSummary, "No verdict summary yet."),
+    ...textSection("## Next step", input.nextStep, "No next step yet."),
+  ].join("\n");
+}
+
 function notionErrorMessage(error: unknown): string {
   if (!isNotionClientError(error)) {
     return error instanceof Error ? error.message : String(error);
@@ -437,6 +477,223 @@ export function createServer() {
         };
         const response = await notion.databases.create(request);
         return asTextResult("Created task database", response);
+      }),
+  );
+
+  server.registerTool(
+    "founder_create_idea_pipeline",
+    {
+      title: "Create Founder Idea Pipeline",
+      description: "Create a Founder OS idea pipeline database with startup-specific properties.",
+      inputSchema: {
+        parentPageId: z.string().optional().describe("Optional parent page ID. Falls back to NOTION_PARENT_PAGE_ID."),
+        title: z.string().default("Founder OS Idea Pipeline").describe("Database title."),
+      },
+    },
+    async ({ parentPageId, title }) =>
+      runTool("founder_create_idea_pipeline", async () => {
+        const notion = getNotionClient();
+        const request: CreateDatabaseParameters = {
+          parent: {
+            page_id: withFallbackParent(parentPageId),
+            type: "page_id",
+          },
+          title: richText(title),
+          initial_data_source: {
+            properties: {
+              Name: { title: {} },
+              Stage: {
+                status: {
+                  options: [
+                    { name: "Inbox", color: "gray" },
+                    { name: "Researching", color: "blue" },
+                    { name: "Validating", color: "yellow" },
+                    { name: "Building", color: "orange" },
+                    { name: "Launched", color: "green" },
+                    { name: "Archived", color: "brown" },
+                  ],
+                },
+              },
+              Verdict: {
+                select: {
+                  options: [
+                    { name: "Promising", color: "green" },
+                    { name: "Needs data", color: "yellow" },
+                    { name: "Risky", color: "orange" },
+                    { name: "Avoid", color: "red" },
+                  ],
+                },
+              },
+              "Risk Level": {
+                select: {
+                  options: [
+                    { name: "Low", color: "green" },
+                    { name: "Medium", color: "yellow" },
+                    { name: "High", color: "red" },
+                  ],
+                },
+              },
+              Category: {
+                select: {
+                  options: [
+                    { name: "AI SaaS", color: "blue" },
+                    { name: "Consumer", color: "pink" },
+                    { name: "Marketplace", color: "purple" },
+                    { name: "Developer Tools", color: "gray" },
+                    { name: "Enterprise", color: "brown" },
+                  ],
+                },
+              },
+              ICP: { rich_text: {} },
+              Problem: { rich_text: {} },
+              "Next Step": { rich_text: {} },
+            },
+          },
+        };
+
+        const response = await notion.databases.create(request);
+        return asTextResult("Created founder idea pipeline", response);
+      }),
+  );
+
+  server.registerTool(
+    "founder_capture_idea",
+    {
+      title: "Capture Founder Idea",
+      description: "Create an idea entry inside the Founder OS pipeline with research summary, risks, and checklist.",
+      inputSchema: {
+        databaseId: z.string().min(1).describe("The Founder OS idea pipeline database ID."),
+        ideaTitle: z.string().min(1).describe("Short working title for the startup idea."),
+        oneLinePitch: z.string().optional().describe("One-sentence summary of the idea."),
+        problem: z.string().optional().describe("Problem the startup is trying to solve."),
+        targetUser: z.string().optional().describe("Ideal customer profile or target audience."),
+        category: z.string().default("AI SaaS").describe("Idea category."),
+        stage: z.string().default("Inbox").describe("Current pipeline stage."),
+        verdict: z.string().default("Needs data").describe("Current judgment on the idea."),
+        riskLevel: z.string().default("Medium").describe("Overall risk level."),
+        nextStep: z.string().optional().describe("Highest-leverage next action."),
+        competitors: z.array(z.string()).default([]).describe("Known competitors or substitutes."),
+        differentiators: z.array(z.string()).default([]).describe("What feels different or defensible."),
+        risks: z.array(z.string()).default([]).describe("Top risks discovered so far."),
+        evidence: z.array(z.string()).default([]).describe("Proof points, demand signals, or observations."),
+        executionChecklist: z.array(z.string()).default([]).describe("Action plan for validation or execution."),
+      },
+    },
+    async ({
+      databaseId,
+      ideaTitle,
+      oneLinePitch,
+      problem,
+      targetUser,
+      category,
+      stage,
+      verdict,
+      riskLevel,
+      nextStep,
+      competitors,
+      differentiators,
+      risks,
+      evidence,
+      executionChecklist,
+    }) =>
+      runTool("founder_capture_idea", async () => {
+        const notion = getNotionClient();
+        const response = await notion.pages.create({
+          parent: {
+            database_id: normalizeId(databaseId),
+          },
+          properties: {
+            Name: titleProperty(ideaTitle),
+            Stage: statusProperty(stage),
+            Verdict: selectProperty(verdict),
+            "Risk Level": selectProperty(riskLevel),
+            Category: selectProperty(category),
+            ...(targetUser ? { ICP: richTextProperty(targetUser) } : {}),
+            ...(problem ? { Problem: richTextProperty(problem) } : {}),
+            ...(nextStep ? { "Next Step": richTextProperty(nextStep) } : {}),
+          },
+          children: markdownToBlocks(
+            buildFounderMemoMarkdown({
+              ideaTitle,
+              oneLinePitch,
+              problem,
+              targetUser,
+              differentiators,
+              competitors,
+              risks,
+              evidence,
+              executionChecklist,
+              verdictSummary: verdict,
+              nextStep,
+            }),
+          ).slice(0, 100),
+        });
+
+        return asTextResult("Captured founder idea", response);
+      }),
+  );
+
+  server.registerTool(
+    "founder_write_founder_memo",
+    {
+      title: "Write Founder Memo",
+      description: "Create a standalone founder memo page with competitor research, risks, and an execution checklist.",
+      inputSchema: {
+        parentPageId: z.string().optional().describe("Optional parent page ID. Falls back to NOTION_PARENT_PAGE_ID."),
+        ideaTitle: z.string().min(1).describe("Idea title."),
+        oneLinePitch: z.string().optional().describe("One-line summary."),
+        problem: z.string().optional().describe("Problem statement."),
+        targetUser: z.string().optional().describe("Target user or ICP."),
+        verdictSummary: z.string().optional().describe("High-level recommendation."),
+        nextStep: z.string().optional().describe("Immediate next action."),
+        competitors: z.array(z.string()).default([]).describe("Competitor research notes."),
+        differentiators: z.array(z.string()).default([]).describe("Differentiators or moat hypotheses."),
+        risks: z.array(z.string()).default([]).describe("Risks or reasons not to build."),
+        evidence: z.array(z.string()).default([]).describe("Signals that support or weaken the idea."),
+        executionChecklist: z.array(z.string()).default([]).describe("Execution plan the founder should follow next."),
+      },
+    },
+    async ({
+      parentPageId,
+      ideaTitle,
+      oneLinePitch,
+      problem,
+      targetUser,
+      verdictSummary,
+      nextStep,
+      competitors,
+      differentiators,
+      risks,
+      evidence,
+      executionChecklist,
+    }) =>
+      runTool("founder_write_founder_memo", async () => {
+        const notion = getNotionClient();
+        const markdown = buildFounderMemoMarkdown({
+          ideaTitle,
+          oneLinePitch,
+          problem,
+          targetUser,
+          differentiators,
+          competitors,
+          risks,
+          evidence,
+          executionChecklist,
+          verdictSummary,
+          nextStep,
+        });
+
+        const response = await notion.pages.create({
+          parent: {
+            page_id: withFallbackParent(parentPageId),
+          },
+          properties: {
+            title: titleProperty(`${ideaTitle} Founder Memo`),
+          },
+          children: markdownToBlocks(markdown).slice(0, 100),
+        });
+
+        return asTextResult("Created founder memo", response);
       }),
   );
 
