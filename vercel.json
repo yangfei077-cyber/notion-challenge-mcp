@@ -1,0 +1,19 @@
+{
+  "buildCommand": "echo \"Skipping static build for function-only MCP deployment\"",
+  "outputDirectory": ".",
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/mcp",
+      "destination": "/api/mcp"
+    }
+  ],
+  "functions": {
+    "api/mcp.ts": {
+      "maxDuration": 60
+    }
+  }
+}
