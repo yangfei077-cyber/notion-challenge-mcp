@@ -16,6 +16,76 @@ import {
   type PolyMarket,
 } from "./polymarket.js";
 
+// ─── Notion direct API client ───────────────────────────────────────────────
+
+const NOTION_TOKEN = process.env.NOTION_TOKEN || "";
+const NOTION_API = "https://api.notion.com/v1";
+
+async function notionFetch(path: string, method = "GET", body?: any): Promise<any> {
+  if (!NOTION_TOKEN) throw new Error("NOTION_TOKEN not set");
+  const res = await fetch(`${NOTION_API}${path}`, {
+    method,
+    headers: {
+      "Authorization": `Bearer ${NOTION_TOKEN}`,
+      "Notion-Version": "2022-06-28",
+      "Content-Type": "application/json",
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Notion API ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+async function notionQueryDatabase(dbId: string): Promise<any[]> {
+  const data = await notionFetch(`/databases/${dbId}/query`, "POST", {});
+  return data.results || [];
+}
+
+function notionGetTitle(page: any): string {
+  const titleProp = Object.values(page.properties).find((p: any) => p.type === "title") as any;
+  return titleProp?.title?.[0]?.plain_text || "";
+}
+
+function notionGetRichText(page: any, propName: string): string {
+  return page.properties?.[propName]?.rich_text?.[0]?.plain_text || "";
+}
+
+function notionGetCheckbox(page: any, propName: string): boolean {
+  return page.properties?.[propName]?.checkbox === true;
+}
+
+function notionGetSelect(page: any, propName: string): string {
+  return page.properties?.[propName]?.select?.name || "";
+}
+
+async function notionUpdatePage(pageId: string, properties: Record<string, any>): Promise<void> {
+  await notionFetch(`/pages/${pageId}`, "PATCH", { properties });
+}
+
+async function notionCreatePage(parentDbId: string, properties: Record<string, any>): Promise<any> {
+  return notionFetch("/pages", "POST", {
+    parent: { database_id: parentDbId },
+    properties,
+  });
+}
+
+async function notionAppendBlocks(pageId: string, children: any[]): Promise<void> {
+  // Notion API limits to 100 blocks per request
+  for (let i = 0; i < children.length; i += 100) {
+    await notionFetch(`/blocks/${pageId}/children`, "PATCH", {
+      children: children.slice(i, i + 100),
+    });
+  }
+}
+
+// ─── Auto-watch state ───────────────────────────────────────────────────────
+
+let watchInterval: ReturnType<typeof setInterval> | null = null;
+let watchConfig: { watchlistDbId: string; researchDbId?: string } | null = null;
+
 // ─── Notion schema templates (for use with the official Notion MCP) ─────────
 
 const WATCHLIST_SCHEMA = {
@@ -2069,6 +2139,268 @@ Example: User types "Trump" in Notion → runs sync → system finds best matchi
           },
         ],
       };
+    },
+  );
+
+  // ─── Auto-Watch: Polling Notion for checkbox changes ────────────────────
+
+  async function processWatchlist(wDbId: string, rDbId?: string): Promise<string[]> {
+    const logs: string[] = [];
+    try {
+      const rows = await notionQueryDatabase(wDbId);
+
+      for (const row of rows) {
+        const pageId = row.id;
+        const title = notionGetTitle(row);
+        const marketId = notionGetRichText(row, "Market ID");
+        const researchChecked = notionGetCheckbox(row, "🔬 Research");
+        const approval = notionGetSelect(row, "Human Approval");
+
+        // A) Checkbox checked → run research
+        if (researchChecked && marketId) {
+          try {
+            logs.push(`🔬 Researching: ${title}`);
+
+            // Call Ollama
+            const m = await getMarketById(marketId);
+            const ollamaPrompt = buildOllamaPrompt(m, 1);
+            const research = await callOllama(ollamaPrompt);
+            const currentYesPrice = yesPrice(m);
+            const edge = research.fair_value - currentYesPrice;
+
+            // Update watchlist row
+            await notionUpdatePage(pageId, {
+              "Signal": { select: { name: research.conviction } },
+              "Fair Value": { number: research.fair_value },
+              "Edge": { number: parseFloat(edge.toFixed(4)) },
+              "Research Status": { select: { name: "Complete" } },
+              "🔬 Research": { checkbox: false }, // Uncheck!
+            });
+
+            // Create research report page if research DB exists
+            if (rDbId) {
+              const researchPage = await notionCreatePage(rDbId, {
+                "Title": { title: [{ text: { content: `Research: ${truncate(m.question, 80)}` } }] },
+                "Market": { rich_text: [{ text: { content: truncate(m.question, 100) } }] },
+                "Market ID": { rich_text: [{ text: { content: m.id.toString() } }] },
+                "Conviction": { select: { name: research.conviction } },
+                "Fair Value": { number: research.fair_value },
+                "Market Price": { number: currentYesPrice },
+                "Edge": { number: parseFloat(edge.toFixed(4)) },
+                "Confidence": { select: { name: research.confidence } },
+                "Date": { date: { start: new Date().toISOString().split("T")[0] } },
+                "Iteration": { number: 1 },
+              });
+
+              // Write beautiful blocks
+              const convictionEmoji: Record<string, string> = {
+                "Strong Buy": "🟢", "Buy": "🔵", "Hold": "⚪", "Sell": "🟡", "Strong Sell": "🔴",
+              };
+              const convictionColor: Record<string, string> = {
+                "Strong Buy": "green_background", "Buy": "blue_background", "Hold": "gray_background",
+                "Sell": "yellow_background", "Strong Sell": "red_background",
+              };
+              const outcomes = parseOutcomes(m);
+
+              const blocks: any[] = [
+                {
+                  object: "block", type: "callout",
+                  callout: {
+                    rich_text: [{ type: "text", text: { content: `Signal: ${research.conviction}  |  Confidence: ${research.confidence}` }, annotations: { bold: true } }],
+                    icon: { type: "emoji", emoji: convictionEmoji[research.conviction] || "📊" },
+                    color: convictionColor[research.conviction] || "gray_background",
+                  },
+                },
+                { object: "block", type: "divider", divider: {} },
+                {
+                  object: "block", type: "heading_2",
+                  heading_2: { rich_text: [{ type: "text", text: { content: "🎯 Valuation" } }] },
+                },
+                {
+                  object: "block", type: "table",
+                  table: {
+                    table_width: 2, has_column_header: false, has_row_header: true,
+                    children: [
+                      { type: "table_row", table_row: { cells: [[{ type: "text", text: { content: "Market Price" }, annotations: { bold: true } }], [{ type: "text", text: { content: `${(currentYesPrice * 100).toFixed(1)}%` } }]] } },
+                      { type: "table_row", table_row: { cells: [[{ type: "text", text: { content: "AI Fair Value" }, annotations: { bold: true } }], [{ type: "text", text: { content: `${(research.fair_value * 100).toFixed(1)}%` } }]] } },
+                      { type: "table_row", table_row: { cells: [[{ type: "text", text: { content: "Edge" }, annotations: { bold: true } }], [{ type: "text", text: { content: `${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}%` }, annotations: { bold: true, color: edge >= 0 ? "green" : "red" } }]] } },
+                    ],
+                  },
+                },
+                { object: "block", type: "divider", divider: {} },
+                {
+                  object: "block", type: "heading_2",
+                  heading_2: { rich_text: [{ type: "text", text: { content: "📈 Base Rate" } }] },
+                },
+                {
+                  object: "block", type: "callout",
+                  callout: {
+                    rich_text: [{ type: "text", text: { content: research.base_rate || "N/A" } }],
+                    icon: { type: "emoji", emoji: "📉" }, color: "purple_background",
+                  },
+                },
+                {
+                  object: "block", type: "heading_2",
+                  heading_2: { rich_text: [{ type: "text", text: { content: "🔍 Key Evidence" } }] },
+                },
+                ...(research.evidence || []).map((e) => ({
+                  object: "block", type: "numbered_list_item",
+                  numbered_list_item: { rich_text: [{ type: "text", text: { content: e } }] },
+                })),
+                { object: "block", type: "divider", divider: {} },
+                {
+                  object: "block", type: "heading_2",
+                  heading_2: { rich_text: [{ type: "text", text: { content: "🧠 Analysis" } }] },
+                },
+                ...(research.analysis || "").split("\n\n").filter(Boolean).map((para) => ({
+                  object: "block", type: "paragraph",
+                  paragraph: { rich_text: [{ type: "text", text: { content: para.trim() } }] },
+                })),
+                { object: "block", type: "divider", divider: {} },
+                {
+                  object: "block", type: "heading_2",
+                  heading_2: { rich_text: [{ type: "text", text: { content: "⚠️ Risks" } }] },
+                },
+                ...(research.risks || []).map((r) => ({
+                  object: "block", type: "bulleted_list_item",
+                  bulleted_list_item: { rich_text: [{ type: "text", text: { content: r } }] },
+                })),
+                { object: "block", type: "divider", divider: {} },
+                {
+                  object: "block", type: "callout",
+                  callout: {
+                    rich_text: [{ type: "text", text: { content: `Generated by PolyDesk + ${OLLAMA_MODEL}  |  ${new Date().toISOString().split("T")[0]}` }, annotations: { italic: true } }],
+                    icon: { type: "emoji", emoji: "🤖" }, color: "gray_background",
+                  },
+                },
+              ];
+
+              await notionAppendBlocks(researchPage.id, blocks);
+              logs.push(`  ✅ Done: ${research.conviction} | Edge: ${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}% | Report written`);
+            } else {
+              logs.push(`  ✅ Done: ${research.conviction} | Edge: ${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}%`);
+            }
+          } catch (err) {
+            logs.push(`  ❌ Error: ${err}`);
+            // Uncheck anyway so it doesn't loop on errors
+            try { await notionUpdatePage(pageId, { "🔬 Research": { checkbox: false } }); } catch {}
+          }
+        }
+
+        // B) Keyword with no Market ID → search
+        if (title && !marketId && title.length < 50) {
+          try {
+            logs.push(`🔍 Searching: "${title}"`);
+            const results = await searchMarkets(title, 1);
+            if (results.length > 0) {
+              const m = results[0];
+              const outcomes = parseOutcomes(m);
+              const yp = yesPrice(m);
+              const np = outcomes.find((o) => o.name.toLowerCase() === "no")?.price ?? (1 - yp);
+              const props: Record<string, any> = {
+                "Market": { title: [{ text: { content: truncate(m.question, 100) } }] },
+                "Market ID": { rich_text: [{ text: { content: m.id.toString() } }] },
+                "Yes Price": { number: yp },
+                "No Price": { number: np },
+                "Volume": { number: num(m.volume) },
+                "Liquidity": { number: num(m.liquidity) },
+                "Research Status": { select: { name: "Pending" } },
+                "Human Approval": { select: { name: "Pending Review" } },
+              };
+              if (m.endDate) props["End Date"] = { date: { start: m.endDate.split("T")[0] } };
+              await notionUpdatePage(pageId, props);
+              logs.push(`  ✅ Found: "${m.question}" (ID: ${m.id})`);
+            } else {
+              logs.push(`  ⚠️ No markets found for "${title}"`);
+            }
+          } catch (err) {
+            logs.push(`  ❌ Error: ${err}`);
+          }
+        }
+      }
+    } catch (err) {
+      logs.push(`❌ Sync error: ${err}`);
+    }
+    return logs;
+  }
+
+  server.tool(
+    "watch",
+    `Start auto-watching the Notion Watchlist. Polls every N seconds for checkbox changes and keyword entries. When user checks 🔬 Research in Notion, AI research runs automatically — no need to say "sync".
+
+Requires NOTION_TOKEN env var. Call "unwatch" to stop.`,
+    {
+      watchlist_database_id: z.string().describe("Notion Watchlist database ID"),
+      research_database_id: z.string().optional().describe("Notion Research Reports database ID"),
+      interval_seconds: z.number().min(10).max(300).default(30).describe("Polling interval in seconds (default 30)"),
+    },
+    async ({ watchlist_database_id, research_database_id, interval_seconds }) => {
+      if (!NOTION_TOKEN) {
+        return {
+          content: [{
+            type: "text",
+            text: "❌ NOTION_TOKEN not set. Add it to the polydesk MCP config in Claude Desktop:\n\n```json\n\"env\": { \"NOTION_TOKEN\": \"ntn_your_token_here\" }\n```",
+          }],
+        };
+      }
+
+      // Stop existing watch if any
+      if (watchInterval) {
+        clearInterval(watchInterval);
+      }
+
+      watchConfig = { watchlistDbId: watchlist_database_id, researchDbId: research_database_id };
+
+      // Start polling
+      watchInterval = setInterval(async () => {
+        if (!watchConfig) return;
+        const logs = await processWatchlist(watchConfig.watchlistDbId, watchConfig.researchDbId);
+        if (logs.length > 0) {
+          server.server.sendLoggingMessage({
+            level: "info",
+            data: `[PolyDesk Watch] ${logs.join(" | ")}`,
+          });
+        }
+      }, interval_seconds * 1000);
+
+      // Run once immediately
+      const logs = await processWatchlist(watchlist_database_id, research_database_id);
+
+      return {
+        content: [{
+          type: "text",
+          text: [
+            `## 👁️ Watching Notion Watchlist`,
+            "",
+            `Polling every ${interval_seconds}s for changes.`,
+            `Database: \`${watchlist_database_id}\``,
+            research_database_id ? `Research DB: \`${research_database_id}\`` : "",
+            "",
+            "**What happens automatically:**",
+            "- ☑️ Check 🔬 Research → AI runs Ollama research → writes report → unchecks box",
+            "- 📝 Type a keyword → finds matching Polymarket market → fills data",
+            "",
+            "Call `unwatch` to stop.",
+            "",
+            logs.length > 0 ? `### Initial scan:\n${logs.join("\n")}` : "No pending actions found.",
+          ].filter(Boolean).join("\n"),
+        }],
+      };
+    },
+  );
+
+  server.tool(
+    "unwatch",
+    "Stop auto-watching the Notion Watchlist. Stops the polling loop started by `watch`.",
+    {},
+    async () => {
+      if (watchInterval) {
+        clearInterval(watchInterval);
+        watchInterval = null;
+        watchConfig = null;
+        return { content: [{ type: "text", text: "⏹️ Stopped watching Notion Watchlist." }] };
+      }
+      return { content: [{ type: "text", text: "Not currently watching." }] };
     },
   );
 
