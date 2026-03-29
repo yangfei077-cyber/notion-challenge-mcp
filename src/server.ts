@@ -62,6 +62,18 @@ const WATCHLIST_SCHEMA = {
       ],
     },
   },
+  "Human Approval": {
+    select: {
+      options: [
+        { name: "Pending Review", color: "yellow" },
+        { name: "Approved", color: "green" },
+        { name: "Rejected", color: "red" },
+        { name: "Needs More Research", color: "orange" },
+      ],
+    },
+  },
+  "Human Notes": { rich_text: {} },
+  "Human Fair Value": { number: { format: "percent" } },
 };
 
 const RESEARCH_SCHEMA = {
@@ -342,6 +354,92 @@ export function createServer(): McpServer {
               "   - If the position hit stop-loss or take-profit levels, flag it",
               "5. Give me a summary table of all open positions with current P&L",
               "6. Highlight any positions that need attention (large drawdown, nearing expiry, etc.)",
+            ].join("\n"),
+          },
+        },
+      ],
+    }),
+  );
+
+  server.prompt(
+    "review-and-execute",
+    "Human-in-the-loop workflow: read back human approvals from Notion, then execute only approved trades. Nothing happens without human sign-off.",
+    () => ({
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: [
+              "Run the PolyDesk human-in-the-loop review cycle:",
+              "",
+              "## Step 1: Read Human Decisions",
+              "Query the Watchlist database using the Notion MCP. Look at these fields:",
+              "- **Human Approval**: 'Approved', 'Rejected', 'Needs More Research', or 'Pending Review'",
+              "- **Human Fair Value**: If the human overrode the AI's fair value estimate",
+              "- **Human Notes**: Any comments the human left",
+              "",
+              "## Step 2: Process Approved Markets",
+              "For each market where Human Approval = 'Approved':",
+              "1. Fetch the latest price using `get_market`",
+              "2. Use the human's Fair Value (if set) OR the AI's Fair Value",
+              "3. Recalculate edge with current price",
+              "4. Use `calculate_trade` to generate a trade plan",
+              "5. Write the trade plan to the Trade Journal with Status = 'Pending Approval'",
+              "",
+              "## Step 3: Handle Other Signals",
+              "- **Rejected**: Skip, update Research Status to 'Complete'",
+              "- **Needs More Research**: Re-run `auto_research_market` with iteration + 1",
+              "- **Pending Review**: Leave as-is, remind me to review",
+              "",
+              "## Step 4: Summary",
+              "Give me a table showing:",
+              "| Market | Human Decision | Action Taken | Edge | Trade Size |",
+              "",
+              "## CRITICAL RULE",
+              "**NEVER execute a trade without 'Approved' status.** This is the human-in-the-loop guarantee.",
+            ].join("\n"),
+          },
+        },
+      ],
+    }),
+  );
+
+  server.prompt(
+    "research-then-review",
+    "Full cycle: scan markets → auto research → write to Notion → WAIT for human review → execute approved trades only.",
+    { market_count: z.string().default("3").describe("How many markets to research") },
+    (args) => ({
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: [
+              `Run a full PolyDesk research-to-execution cycle for ${args.market_count} markets:`,
+              "",
+              "## Phase 1: Research (AI does this now)",
+              "1. Use `scan_trending_markets` to find hot markets",
+              `2. Pick the top ${args.market_count} by volume`,
+              "3. For each, run `auto_research_market` and analyze",
+              "4. Write findings to Notion via Notion MCP:",
+              "   - Add to Watchlist with AI signal, fair value, edge",
+              "   - Set **Human Approval** = 'Pending Review'",
+              "   - Create a Research Report page with full analysis",
+              "",
+              "## Phase 2: Human Review (human does this in Notion)",
+              "Tell the user: 'I've written my research to Notion. Please review each market in the Watchlist:'",
+              "- Change **Human Approval** to 'Approved' / 'Rejected' / 'Needs More Research'",
+              "- Optionally override **Human Fair Value** with your own estimate",
+              "- Add any **Human Notes**",
+              "",
+              "## Phase 3: Execution (AI does this after human review)",
+              "When the user says 'proceed' or 'execute':",
+              "1. Read back the Watchlist from Notion",
+              "2. Only process markets with Human Approval = 'Approved'",
+              "3. Calculate trades and write to Trade Journal",
+              "",
+              "**Nothing trades without human approval.**",
             ].join("\n"),
           },
         },
@@ -934,6 +1032,184 @@ export function createServer(): McpServer {
               "",
               "---",
               "Flags are heuristic only — use `auto_research_market` for proper analysis before trading.",
+            ].join("\n"),
+          },
+        ],
+      };
+    },
+  );
+
+  // ─── Human-in-the-Loop Tools ───────────────────────────────────────────
+
+  server.tool(
+    "generate_execution_plan",
+    "Given a list of human-approved markets with fair values, generate a portfolio execution plan with position sizing (Kelly criterion), risk limits, and correlation checks. Use after reading human approvals from Notion.",
+    {
+      approved_markets: z
+        .array(
+          z.object({
+            market_id: z.string().describe("Polymarket market ID"),
+            side: z.enum(["Yes", "No"]).describe("Which side to trade"),
+            human_fair_value: z.number().min(0).max(1).describe("Human-approved fair value"),
+            max_size_usd: z.number().min(0).default(100).describe("Max position size in USD"),
+          }),
+        )
+        .min(1)
+        .max(10)
+        .describe("Markets approved by the human for trading"),
+      total_bankroll: z
+        .number()
+        .min(0)
+        .default(1000)
+        .describe("Total bankroll in USD"),
+      max_portfolio_risk: z
+        .number()
+        .min(0)
+        .max(1)
+        .default(0.2)
+        .describe("Max fraction of bankroll at risk (default 20%)"),
+    },
+    async ({ approved_markets, total_bankroll, max_portfolio_risk }) => {
+      const plans: string[] = [];
+      let totalAllocation = 0;
+
+      for (const am of approved_markets) {
+        try {
+          const m = await getMarketById(am.market_id);
+          const outcomes = parseOutcomes(m);
+          const currentPrice =
+            am.side === "Yes"
+              ? (outcomes.find((o) => o.name.toLowerCase() === "yes")?.price ?? outcomes[0]?.price ?? 0)
+              : (outcomes.find((o) => o.name.toLowerCase() === "no")?.price ?? outcomes[1]?.price ?? 0);
+
+          const edge = am.human_fair_value - currentPrice;
+          const kellyFull =
+            currentPrice > 0
+              ? (am.human_fair_value * (1 / currentPrice - 1) - (1 - am.human_fair_value)) / (1 / currentPrice - 1)
+              : 0;
+          const kellyHalf = Math.max(0, kellyFull * 0.5);
+          const kellySize = Math.min(
+            kellyHalf * total_bankroll,
+            am.max_size_usd,
+            total_bankroll * max_portfolio_risk - totalAllocation,
+          );
+          const finalSize = Math.max(0, parseFloat(kellySize.toFixed(2)));
+          totalAllocation += finalSize;
+
+          const rr = edge > 0 ? (1 - currentPrice) / currentPrice : 0;
+
+          plans.push(
+            [
+              `### ${am.side} — ${truncate(m.question, 60)}`,
+              `| Field | Value |`,
+              `|-------|-------|`,
+              `| Market ID | \`${am.market_id}\` |`,
+              `| Current Price | ${(currentPrice * 100).toFixed(1)}% |`,
+              `| Human Fair Value | ${(am.human_fair_value * 100).toFixed(1)}% |`,
+              `| Edge | ${(edge * 100).toFixed(1)}% |`,
+              `| Kelly (full) | ${(kellyFull * 100).toFixed(1)}% |`,
+              `| Kelly (half) | ${(kellyHalf * 100).toFixed(1)}% |`,
+              `| Position Size | $${finalSize.toFixed(2)} |`,
+              `| R:R | ${rr.toFixed(2)}x |`,
+              edge <= 0 ? `| **WARNING** | Negative edge — human approved but price moved |` : "",
+            ].filter(Boolean).join("\n"),
+          );
+        } catch (err) {
+          plans.push(`### Error: \`${am.market_id}\` — ${err}`);
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `# Execution Plan — ${approved_markets.length} Approved Trade(s)`,
+              "",
+              `**Bankroll:** $${total_bankroll} | **Max Risk:** ${(max_portfolio_risk * 100).toFixed(0)}% | **Total Allocated:** $${totalAllocation.toFixed(2)} (${((totalAllocation / total_bankroll) * 100).toFixed(1)}%)`,
+              "",
+              ...plans,
+              "",
+              "---",
+              "## Next Steps",
+              "1. Review this plan",
+              "2. Use the Notion MCP to create Trade Journal entries for each position",
+              "3. Set each Trade Journal entry Status = 'Open'",
+              "",
+              totalAllocation > total_bankroll * max_portfolio_risk
+                ? "**WARNING: Total allocation exceeds risk limit. Some positions were reduced.**"
+                : "",
+            ].filter(Boolean).join("\n"),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "validate_human_overrides",
+    "Check if human fair value overrides are reasonable by comparing against market data and flagging potential errors. Use before executing approved trades.",
+    {
+      overrides: z
+        .array(
+          z.object({
+            market_id: z.string().describe("Polymarket market ID"),
+            human_fair_value: z.number().min(0).max(1).describe("Human-set fair value"),
+            ai_fair_value: z.number().min(0).max(1).describe("AI-estimated fair value"),
+          }),
+        )
+        .min(1)
+        .max(10),
+    },
+    async ({ overrides }) => {
+      const checks: string[] = [];
+
+      for (const ov of overrides) {
+        const flags: string[] = [];
+        try {
+          const m = await getMarketById(ov.market_id);
+          const currentPrice = yesPrice(m);
+          const humanEdge = ov.human_fair_value - currentPrice;
+          const aiEdge = ov.ai_fair_value - currentPrice;
+          const divergence = Math.abs(ov.human_fair_value - ov.ai_fair_value);
+
+          if (divergence > 0.2) {
+            flags.push(`Large human-AI divergence: ${(divergence * 100).toFixed(1)}% — verify reasoning`);
+          }
+          if (ov.human_fair_value > 0.95 || ov.human_fair_value < 0.05) {
+            flags.push(`Extreme fair value (${(ov.human_fair_value * 100).toFixed(1)}%) — very high conviction needed`);
+          }
+          if (humanEdge < 0) {
+            flags.push(`Negative edge at current price — market moved since analysis?`);
+          }
+          if (humanEdge > 0.3) {
+            flags.push(`Edge > 30% — unusually large, double-check`);
+          }
+
+          const status = flags.length === 0 ? "PASS" : "FLAG";
+          checks.push(
+            [
+              `**${truncate(m.question, 60)}** — ${status}`,
+              `  Market: ${(currentPrice * 100).toFixed(1)}% | AI: ${(ov.ai_fair_value * 100).toFixed(1)}% | Human: ${(ov.human_fair_value * 100).toFixed(1)}%`,
+              ...flags.map((f) => `  ⚠️ ${f}`),
+            ].join("\n"),
+          );
+        } catch (err) {
+          checks.push(`**\`${ov.market_id}\`** — ERROR: ${err}`);
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `## Human Override Validation — ${overrides.length} check(s)`,
+              "",
+              ...checks,
+              "",
+              "---",
+              "If all checks pass, proceed with `generate_execution_plan`.",
             ].join("\n"),
           },
         ],
