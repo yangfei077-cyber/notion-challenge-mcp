@@ -7,7 +7,7 @@ async function main() {
   await server.connect(transport);
   await server.sendLoggingMessage({
     level: "info",
-    data: "notion-challenge-mcp stdio server is ready.",
+    data: "polydesk-mcp server is ready.",
   });
 }
 

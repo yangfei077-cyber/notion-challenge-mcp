@@ -1,149 +1,137 @@
-# Founder OS MCP
+# PolyDesk — Polymarket AI Research & Trading Control Plane
 
-A Founder OS MCP server built for the DEV Notion Challenge:
-[https://dev.to/challenges/notion-2026-03-04](https://dev.to/challenges/notion-2026-03-04)
+An MCP server that turns Polymarket prediction markets into a structured research and trading workflow — powered by **Notion MCP** as the dashboard and knowledge base.
 
-This project turns Notion into an idea pipeline for founders. The intended loop is:
+Inspired by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch): the AI agent runs iterative research loops on prediction markets, scores them, and writes structured findings to Notion for human review and trade execution.
 
-1. a founder records an idea
-2. an agent researches competitors and substitutes
-3. the agent judges risk and opportunity
-4. the agent writes an execution checklist
-5. everything lands in Notion as an idea pipeline plus founder memos
+## Architecture
 
-## Why this project fits the challenge
+```
+┌──────────────┐     ┌──────────────────┐     ┌──────────────┐
+│  Polymarket  │────→│   PolyDesk MCP   │────→│   AI Agent   │
+│  Gamma API   │     │  (this server)   │     │ (Claude, etc)│
+└──────────────┘     └──────────────────┘     └──────┬───────┘
+                                                     │
+                                                     ▼
+                                              ┌──────────────┐
+                                              │  Notion MCP  │
+                                              │  (official)  │
+                                              └──────┬───────┘
+                                                     │
+                                                     ▼
+                                              ┌──────────────┐
+                                              │   Notion     │
+                                              │  Workspace   │
+                                              │  (Dashboard) │
+                                              └──────────────┘
+```
 
-The challenge asks for an impressive system or process where Notion MCP is a core building block. This project is not just a CRUD wrapper:
+**PolyDesk MCP** provides Polymarket data and research intelligence.
+**Notion MCP** (official) handles all Notion CRUD operations.
+The AI agent orchestrates both to create a full trading control plane.
 
-- the MCP server exposes founder-specific tools instead of only low-level API calls
-- the tools are designed for agent loops where research happens outside and the structured result is written back into Notion
-- the `founder_create_idea_pipeline`, `founder_capture_idea`, and `founder_write_founder_memo` tools make the workflow concrete
+## Features
+
+### Tools (12 total)
+
+| Tool | Description |
+|------|-------------|
+| `scan_trending_markets` | Discover hottest markets by volume |
+| `search_markets` | Search markets by keyword |
+| `get_market` | Full details for a specific market |
+| `get_events` | Browse top events (grouped markets) |
+| `get_event` | Details for a specific event |
+| `get_prices` | Bulk price feed for multiple markets |
+| `auto_research_market` | Generate structured research prompt (autoresearch pattern) |
+| `batch_research` | Research multiple markets in one loop |
+| `calculate_trade` | Position sizing, R:R, Kelly criterion |
+| `check_positions` | Live P&L for open positions |
+| `compare_markets` | Side-by-side odds comparison |
+| `edge_scanner` | Heuristic mispricing detector |
+
+### Resources
+
+| Resource | Description |
+|----------|-------------|
+| `polydesk://schemas/notion-databases` | Notion database schemas for Watchlist, Research, and Trade Journal |
+
+### Prompts
+
+| Prompt | Description |
+|--------|-------------|
+| `setup-trading-desk` | Bootstrap the full Notion workspace |
+| `daily-research-loop` | Run a complete research cycle on trending markets |
+| `trade-review` | Sync positions and generate P&L summary |
+
+## How the Auto Research Loop Works
+
+Inspired by Karpathy's autoresearch ratchet mechanism:
+
+1. **Scan** — `scan_trending_markets` or `edge_scanner` identifies opportunities
+2. **Research** — `auto_research_market` generates a structured research prompt
+3. **Analyze** — The AI agent analyzes the market: base rates, evidence, fair value
+4. **Record** — Findings are written to Notion via the official Notion MCP server
+5. **Iterate** — Re-run with `iteration: 2, 3, ...` to refine analysis as new data arrives
+6. **Ratchet** — Only upgrade conviction when evidence is stronger than previous iteration
+
+This mirrors autoresearch's core insight: **let the AI run iterative experiments, keep what improves, discard what doesn't.**
 
 ## Setup
 
-1. Create a Notion integration:
-   [https://www.notion.so/profile/integrations](https://www.notion.so/profile/integrations)
-2. Copy the integration token.
-3. Share the target parent page with that integration.
-4. Create a `.env` file:
-
-```bash
-cp .env.example .env
-```
-
-5. Add your values:
-
-```bash
-NOTION_API_KEY=ntn_your_integration_token
-NOTION_PARENT_PAGE_ID=your_parent_page_id
-```
-
-## Install and run
+### 1. Install
 
 ```bash
 npm install
 npm run build
-export $(cat .env | xargs)
-npm start
 ```
 
-For local development:
+### 2. Configure Claude Desktop
 
-```bash
-export $(cat .env | xargs)
-npm run dev
-```
-
-## Example MCP client config
-
-Use this server with any stdio MCP client:
+Add both MCP servers to your `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "founder-os": {
+    "polydesk": {
       "command": "node",
-      "args": [
-        "/Users/yangfei/projects/mcp/dist/src/index.js"
-      ],
+      "args": ["/path/to/polydesk-mcp/dist/index.js"]
+    },
+    "notion": {
+      "command": "npx",
+      "args": ["-y", "@notionhq/notion-mcp-server"],
       "env": {
-        "NOTION_API_KEY": "ntn_your_integration_token",
-        "NOTION_PARENT_PAGE_ID": "your_parent_page_id"
+        "OPENAPI_MCP_HEADERS": "{\"Authorization\": \"Bearer ntn_YOUR_TOKEN\", \"Notion-Version\": \"2022-06-28\"}"
       }
     }
   }
 }
 ```
 
-For the deployed HTTP endpoint:
+### 3. Bootstrap Your Workspace
 
-- root: `https://mcp-ten-gold.vercel.app`
-- MCP endpoint: `https://mcp-ten-gold.vercel.app/mcp`
+In Claude Desktop, run the `setup-trading-desk` prompt to create the Notion databases.
 
-## Founder OS tools
+### 4. Start Researching
 
-### `founder_create_idea_pipeline`
+```
+"Scan trending markets and research the top 5"
+"Find markets about bitcoin and analyze the best opportunity"
+"Run the daily research loop"
+"Check my open positions and update the trade journal"
+```
 
-Create a Notion database for startup ideas with stage, verdict, risk level, category, ICP, problem, and next-step fields.
+## No API Keys Required
 
-### `founder_capture_idea`
+PolyDesk uses the **public Polymarket Gamma API** — no authentication needed for market data. Notion access is handled entirely by the official Notion MCP server.
 
-Create a pipeline entry with structured sections for one-line pitch, target user, competitor signals, risk flags, evidence, and an execution checklist.
+## Development
 
-### `founder_write_founder_memo`
+```bash
+npm run dev    # Run with tsx (hot reload)
+npm run check  # Type-check
+npm run build  # Compile to dist/
+```
 
-Create a standalone founder memo page that summarizes research, judgment, and next actions.
+## License
 
-## Generic Notion tools
-
-### `notion_search`
-
-Search pages or data sources in the workspace.
-
-### `notion_get_page`
-
-Fetch a page with its properties.
-
-### `notion_get_blocks`
-
-Fetch child blocks for a page or block.
-
-### `notion_create_page`
-
-Create a page under a parent page and optionally seed it with markdown-ish content.
-
-### `notion_append_markdown`
-
-Append markdown-ish content to an existing page.
-
-### `notion_create_task_database`
-
-Create a reusable task database under a parent page.
-
-### `notion_add_task`
-
-Add a task into a Notion database.
-
-### `notion_create_daily_brief`
-
-Create a structured daily brief page with priorities, blockers, and notes.
-
-## Demo flow
-
-1. Run `founder_create_idea_pipeline` under a shared project page.
-2. Ask your agent to research an idea and summarize competitor signals, risks, and evidence.
-3. Run `founder_capture_idea` to create the pipeline entry.
-4. Run `founder_write_founder_memo` to create a longer memo page for the same idea.
-5. Use `notion_search` and `notion_get_page` to let the agent continue navigating the workspace.
-
-## Submission draft
-
-You can adapt this angle for the DEV post:
-
-> I built a Founder OS on top of Notion MCP. A founder records an idea, an agent researches competitors and substitutes, judges the biggest risks, proposes an execution checklist, and writes everything back into a Notion idea pipeline plus founder memo pages. Notion becomes the operating system for deciding what to build next.
-
-## Notes
-
-- The server uses the Notion API version `2026-03-11`.
-- The markdown support is intentionally basic: headings, bullets, numbered items, quotes, dividers, and paragraphs.
-- Your integration must be invited to every page or database it should access.
+MIT

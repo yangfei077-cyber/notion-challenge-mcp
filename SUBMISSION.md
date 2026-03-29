@@ -1,42 +1,56 @@
-# DEV Notion Challenge Submission Draft
+# PolyDesk — Polymarket AI Research & Trading Control Plane
 
-## Title
+## What I Built
 
-I built a Founder OS on top of Notion MCP that decides what startup ideas are worth building
+PolyDesk is an MCP server that brings **prediction market intelligence** into your AI workflow. It connects to Polymarket's real-time data and works alongside the **official Notion MCP server** to create a complete research and trading control plane — all inside Notion.
 
-## Pitch
+The core innovation is an **auto-research loop** inspired by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch): the AI agent iteratively researches prediction markets, evaluates odds against fair value, and writes structured reports to Notion. Like autoresearch's ratchet mechanism, each iteration only updates conviction when new evidence warrants it.
 
-For the Notion challenge, I wanted to build something more opinionated than a generic wrapper. I turned Notion into a Founder OS:
+## Demo
 
-- a founder records an idea
-- an agent researches competitors and substitutes
-- the agent judges risk and upside
-- the agent generates an execution checklist
-- the result lands in a Notion idea pipeline and a founder memo page
+<!-- VIDEO DEMO LINK HERE -->
 
-The result is a workflow where Notion becomes the system of record for deciding what to build, what to validate, and what to ignore.
+## How Notion MCP Is Used
 
-## What makes it interesting
+PolyDesk is designed as a **companion to the official Notion MCP server**, not a replacement. The two servers work together:
 
-- It is usable right away with any MCP-capable client.
-- It focuses on startup decision-making instead of low-level API plumbing.
-- It demonstrates a clear agent loop: research outside, judge, then write structured output back into Notion.
+- **PolyDesk MCP** → Polymarket data feeds, research intelligence, trade calculations, edge detection
+- **Notion MCP** → Creates and manages the trading dashboard: Watchlist, Research Reports, Trade Journal databases
 
-## How it works
+The AI agent orchestrates both servers. For example, during a research loop:
+1. PolyDesk's `auto_research_market` generates a structured research prompt with live market data
+2. The AI agent analyzes the market and forms a thesis
+3. The Notion MCP writes the findings as a Research Report page with structured properties
+4. The Notion MCP updates the Watchlist entry with the new signal and fair value
 
-- The MCP server runs over stdio and Streamable HTTP.
-- It authenticates with a standard Notion integration token.
-- It uses the latest Notion API version available during the challenge build: `2026-03-11`.
-- It exposes startup-specific tools like `founder_create_idea_pipeline`, `founder_capture_idea`, and `founder_write_founder_memo`.
+PolyDesk provides **Notion database schemas as an MCP resource** (`polydesk://schemas/notion-databases`) so the AI agent knows exactly how to structure data in Notion. It also provides **3 MCP prompts** that orchestrate multi-step workflows across both servers.
 
-## Demo idea
+This architecture demonstrates the power of **MCP server composition** — specialized servers working together through the AI agent as orchestrator.
 
-1. Point the server at a shared project page.
-2. Ask the agent to create the Founder OS idea pipeline.
-3. Give the agent a startup idea and have it research competitor signals.
-4. Ask it to judge the main risks and generate an execution checklist.
-5. Have it write the result into the pipeline and a founder memo page.
+## Tools & Capabilities
 
-## Repo note
+### 12 Tools
+- Market discovery: `scan_trending_markets`, `search_markets`, `get_market`, `get_events`, `get_event`
+- Price feeds: `get_prices`
+- Research: `auto_research_market`, `batch_research`
+- Trading: `calculate_trade`, `check_positions`
+- Analysis: `compare_markets`, `edge_scanner`
 
-Project root: `/Users/yangfei/projects/mcp`
+### 1 Resource
+- `polydesk://schemas/notion-databases` — Notion database schemas for the trading desk
+
+### 3 Prompts
+- `setup-trading-desk` — Bootstrap the full Notion workspace
+- `daily-research-loop` — Automated research cycle
+- `trade-review` — Position sync and P&L review
+
+## Tech Stack
+
+- TypeScript + MCP SDK
+- Polymarket Gamma API (public, no auth required)
+- Official Notion MCP server (for all Notion operations)
+- Deployed on Vercel (Streamable HTTP transport)
+
+## Repo
+
+<!-- GITHUB REPO LINK HERE -->

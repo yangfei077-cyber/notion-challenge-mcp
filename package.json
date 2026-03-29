@@ -1,11 +1,11 @@
 {
-  "name": "notion-challenge-mcp",
-  "version": "0.1.0",
-  "description": "A Notion MCP server for the DEV Notion Challenge.",
+  "name": "polydesk-mcp",
+  "version": "1.0.0",
+  "description": "PolyDesk — Polymarket AI Research & Trading Control Plane. Auto-research prediction markets, manage trades via Notion dashboard. Works alongside the official Notion MCP server.",
   "type": "module",
   "private": true,
   "bin": {
-    "notion-challenge-mcp": "./dist/index.js"
+    "polydesk-mcp": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -16,14 +16,17 @@
   "keywords": [
     "mcp",
     "notion",
-    "challenge",
-    "typescript"
+    "polymarket",
+    "prediction-markets",
+    "trading",
+    "auto-research",
+    "ai-agent"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.28.0",
-    "@notionhq/client": "^5.4.0",
+    "@notionhq/notion-mcp-server": "^2.2.1",
     "zod": "^4.1.11"
   },
   "devDependencies": {
