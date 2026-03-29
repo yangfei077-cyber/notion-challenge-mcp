@@ -74,6 +74,7 @@ const WATCHLIST_SCHEMA = {
   },
   "Human Notes": { rich_text: {} },
   "Human Fair Value": { number: { format: "percent" } },
+  "🔬 Research": { checkbox: {} },
 };
 
 const RESEARCH_SCHEMA = {
@@ -628,9 +629,10 @@ This tool returns step-by-step instructions. Execute them using the Notion MCP t
               "## Step 5: Done",
               "Report the database IDs and tell the user:",
               "'Your trading desk is ready! You can now:'",
-              "'- Type a keyword (like Trump, Bitcoin) in the Watchlist title column and tell me to sync'",
-              "'- Change Research Status to In Progress and tell me to sync — I will run AI research'",
+              "'- Check the 🔬 Research checkbox on any market row, then tell me \"sync\" — AI research will run automatically'",
+              "'- Type a keyword (like Trump, Bitcoin) in a new row title, then \"sync\" — I will find the matching market'",
               "'- Review research reports and set Human Approval to Approved/Rejected'",
+              "'- Tell me \"sync\" anytime to process all changes at once'",
             ].join("\n"),
           },
         ],
@@ -1991,10 +1993,10 @@ Workflow:
 
   server.tool(
     "sync_notion_watchlist",
-    `Bidirectional sync between Notion Watchlist and Polymarket/Ollama. Reads your Notion Watchlist database and processes changes:
+    `Bidirectional sync between Notion Watchlist and Polymarket/Ollama. Call this when user says "sync". Reads your Notion Watchlist database and processes changes:
 
-1. **Keyword → Market**: If a row has a keyword in the Market column but no Market ID, searches Polymarket and populates all data
-2. **Research trigger**: If Research Status = "In Progress", runs Ollama AI research and writes a beautiful report
+1. **🔬 Research checkbox**: If checked (true), runs Ollama AI research, writes report, then UNCHECKS the box
+2. **Keyword → Market**: If a row has a keyword in the Market column but no Market ID, searches Polymarket and populates all data
 3. **Approval action**: If Human Approval = "Approved", generates an execution plan
 4. **Re-research**: If Human Approval = "Needs More Research", runs research again with iteration+1
 5. **Price refresh**: Updates all prices to latest
@@ -2016,33 +2018,38 @@ Example: User types "Trump" in Notion → runs sync → system finds best matchi
               "Execute these steps using the Notion MCP:",
               "",
               "### Step 1: Read All Watchlist Rows",
-              `Query database \`${watchlist_database_id}\` using the Notion MCP. Read every row's properties: Market (title), Market ID, Research Status, Human Approval, Human Fair Value.`,
+              `Query database \`${watchlist_database_id}\` using the Notion MCP. Read every row's properties: Market (title), Market ID, 🔬 Research (checkbox), Research Status, Human Approval, Human Fair Value.`,
               "",
-              "### Step 2: Process Each Row",
+              "### Step 2: Process Each Row (in this priority order)",
               "",
-              "**A) Keyword → Market (rows with title but empty Market ID):**",
+              "**A) 🔬 Research checkbox is CHECKED (highest priority):**",
+              "The user checked the research checkbox — this is the interactive trigger!",
+              run_research
+                ? [
+                    "1. Get the Market ID from the row",
+                    "2. Call PolyDesk `research_with_ollama` with the Market ID",
+                    "3. Update the Watchlist row via API-patch-page:",
+                    '   - Set Signal, Fair Value, Edge from research results',
+                    '   - Set Research Status = "Complete"',
+                    '   - **UNCHECK the 🔬 Research checkbox** (set to false) so it can be clicked again',
+                    research_database_id
+                      ? `4. Create a Research page in database \`${research_database_id}\` with the research properties`
+                      : "",
+                    research_database_id
+                      ? "5. Write the beautiful Notion blocks to that research page via API-patch-block-children"
+                      : "",
+                  ].filter(Boolean).join("\n")
+                : "Skip (run_research = false)",
+              "",
+              "**B) Keyword → Market (rows with title but empty Market ID):**",
               "The title column contains a search keyword (e.g., 'Trump', 'bitcoin', 'World Cup').",
               "1. Call PolyDesk `search_markets` with that keyword",
               "2. Pick the top result by volume",
               "3. Call `format_watchlist_entry` with that market's ID to get Notion properties",
               "4. Update the row via Notion MCP API-patch-page — fill in Market ID, Yes Price, No Price, Volume, Liquidity, End Date",
-              "5. Keep the title as the full market question",
+              "5. Update the title to the full market question",
               "",
-              "**B) Research trigger (Research Status = 'In Progress'):**",
-              run_research
-                ? [
-                    "1. Call PolyDesk `research_with_ollama` with the Market ID",
-                    "2. Update the Watchlist row: Signal, Fair Value, Edge, Research Status = 'Complete'",
-                    research_database_id
-                      ? `3. Create a Research page in database \`${research_database_id}\` with the research properties from the tool output`
-                      : "",
-                    research_database_id
-                      ? "4. Write the beautiful Notion blocks to that research page via API-patch-block-children"
-                      : "",
-                  ].filter(Boolean).join("\n")
-                : "Skip (run_research = false)",
-              "",
-              "**C) Approved (Human Approval = 'Approved'):**",
+              "**C) Approved (Human Approval = 'Approved' and no trade plan yet):**",
               "1. Read Human Fair Value if set, otherwise use the AI Fair Value",
               "2. Call PolyDesk `calculate_trade` or `generate_execution_plan`",
               "3. Report the trade plan",
@@ -2052,12 +2059,12 @@ Example: User types "Trump" in Notion → runs sync → system finds best matchi
               "2. Update row and write new research report",
               "3. Set Human Approval back to 'Pending Review'",
               "",
-              "**E) All other rows with Market ID:**",
+              "**E) All other rows with Market ID (price refresh):**",
               "1. Call PolyDesk `get_market` to refresh prices",
               "2. Update Yes Price, No Price, Volume via API-patch-page",
               "",
               "### Step 3: Report",
-              "Summarize: keywords matched, markets researched, approvals processed, prices refreshed.",
+              "Summarize: checkboxes processed, keywords matched, markets researched, approvals processed, prices refreshed.",
             ].join("\n"),
           },
         ],
