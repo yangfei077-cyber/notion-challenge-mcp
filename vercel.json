@@ -1,6 +1,4 @@
 {
-  "buildCommand": "echo \"Skipping static build for function-only MCP deployment\"",
-  "outputDirectory": ".",
   "rewrites": [
     {
       "source": "/",
