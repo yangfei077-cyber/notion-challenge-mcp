@@ -138,6 +138,104 @@ const JOURNAL_SCHEMA = {
   "Exit Date": { date: {} },
 };
 
+// ─── Ollama integration ─────────────────────────────────────────────────────
+
+const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5:14b";
+
+interface OllamaResearch {
+  conviction: string;
+  fair_value: number;
+  confidence: string;
+  edge: number;
+  base_rate: string;
+  evidence: string[];
+  risks: string[];
+  analysis: string;
+}
+
+async function callOllama(prompt: string): Promise<OllamaResearch> {
+  const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: OLLAMA_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are an expert prediction market analyst. Always respond with valid JSON only, no markdown formatting.",
+        },
+        { role: "user", content: prompt },
+      ],
+      stream: false,
+      options: { temperature: 0.3 },
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Ollama error ${res.status}: ${errText}`);
+  }
+
+  const data: any = await res.json();
+  const rawContent = data.message?.content || "";
+
+  try {
+    const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
+    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+  } catch {}
+
+  return {
+    conviction: "Hold",
+    fair_value: 0.5,
+    confidence: "Low",
+    edge: 0,
+    base_rate: rawContent.slice(0, 200),
+    evidence: [],
+    risks: [],
+    analysis: rawContent,
+  };
+}
+
+function buildOllamaPrompt(m: PolyMarket, iteration: number): string {
+  const outcomes = parseOutcomes(m);
+  const outcomeStr = outcomes
+    .map((o) => `- ${o.name}: ${o.impliedProb} ($${o.price.toFixed(3)})`)
+    .join("\n");
+
+  return `You are an expert prediction market analyst. Analyze this Polymarket market and provide a structured research report.
+
+## Market
+**${m.question}**
+
+## Current Odds
+${outcomeStr}
+
+## Stats
+- Volume: ${formatVolume(num(m.volume))}
+- Liquidity: ${formatVolume(num(m.liquidity))}
+- End Date: ${m.endDate?.split("T")[0] ?? "N/A"}
+
+## Description
+${truncate(m.description ?? "N/A", 1500)}
+
+---
+
+Provide your analysis in this exact JSON format (no markdown, just raw JSON):
+{
+  "conviction": "Strong Buy" | "Buy" | "Hold" | "Sell" | "Strong Sell",
+  "fair_value": <number 0-1, your estimated fair probability for Yes>,
+  "confidence": "High" | "Medium" | "Low",
+  "edge": <number, fair_value minus current Yes price>,
+  "base_rate": "<1-2 sentences on historical base rate>",
+  "evidence": ["<key evidence point 1>", "<key evidence point 2>", "<key evidence point 3>"],
+  "risks": ["<risk 1>", "<risk 2>"],
+  "analysis": "<2-3 paragraph analysis>",
+  "iteration": ${iteration}
+}`;
+}
+
 // ─── Helper: generate auto-research prompt ──────────────────────────────────
 
 function buildResearchPrompt(m: PolyMarket, iteration: number): string {
@@ -267,7 +365,7 @@ export function createServer(): McpServer {
 
   server.prompt(
     "setup-trading-desk",
-    "Bootstrap the full PolyDesk workspace in Notion. Creates the dashboard page and 3 databases (Watchlist, Research, Journal).",
+    "Bootstrap the full PolyDesk workspace in Notion: creates dashboard page, 3 databases, and populates with live Polymarket data in spreadsheet view.",
     () => ({
       messages: [
         {
@@ -275,25 +373,43 @@ export function createServer(): McpServer {
           content: {
             type: "text" as const,
             text: [
-              "Set up my PolyDesk trading desk in Notion. Follow these steps using the Notion MCP server:",
+              "Set up my PolyDesk trading desk in Notion. Use ENGLISH for all content. Follow these steps:",
               "",
-              "1. Create a new page titled 'PolyDesk — Prediction Market Trading Desk' with icon 📊",
-              "2. Add this intro text to the page:",
-              "   > AI-powered prediction market research and trading control plane.",
-              "   > Powered by Polymarket data + Karpathy-inspired auto-research loops.",
+              "## Step 1: Create Main Page",
+              "Create a page titled 'PolyDesk Trading Desk' with icon 📊.",
+              "Add these blocks to the page using API-patch-block-children:",
               "",
-              "3. Create 3 databases under that page. Use these exact schemas:",
+              "- callout (icon: 🚀, blue_background): 'AI-powered prediction market research & trading control plane. Powered by Polymarket data + Karpathy autoresearch ratchet.'",
+              "- divider",
+              "- callout (icon: 🔒, green_background): 'Human-in-the-loop: AI researches → you review in this spreadsheet → only approved trades get planned. Nothing happens without your sign-off.'",
+              "- divider",
               "",
-              "### Market Watchlist (icon: 👁️)",
-              "Read the `polydesk://schemas/notion-databases` resource for the full schema.",
+              "## Step 2: Create Databases",
+              "Read the `polydesk://schemas/notion-databases` resource for schemas.",
+              "Create 3 inline databases under the main page:",
               "",
-              "### Research Reports (icon: 🔬)",
-              "Read the `polydesk://schemas/notion-databases` resource for the full schema.",
+              "1. **Market Watchlist** (icon: 👁️) — the main spreadsheet. Show as TABLE view with columns: Market, Yes Price, Volume, Signal, Edge, Research Status, Human Approval",
+              "2. **Research Reports** (icon: 🔬) — each entry becomes a rich research page",
+              "3. **Trade Journal** (icon: 📒) — tracks execution plans",
               "",
-              "### Trade Journal (icon: 📒)",
-              "Read the `polydesk://schemas/notion-databases` resource for the full schema.",
+              "## Step 3: Populate Watchlist with Live Data",
+              "Use `scan_trending_markets` (limit 10) to get live Polymarket data.",
+              "For each market, use `format_watchlist_entry` to generate the properties.",
+              "Add each as a row in the Watchlist database via API-post-page.",
+              "Set Research Status = 'Pending' and Human Approval = 'Pending Review' for all.",
               "",
-              "4. After creating, report back the database IDs so I can use them with other tools.",
+              "## Step 4: Run Research on Top 3",
+              "Pick the top 3 markets by volume.",
+              "For each:",
+              "1. Call `auto_research_market` and analyze it",
+              "2. Call `format_research_for_notion` with your analysis results",
+              "3. Create a page in the Research Reports database via API-post-page",
+              "4. Write the beautiful blocks to that page via API-patch-block-children",
+              "5. Update the Watchlist row: set Signal, Fair Value, Edge, Research Status = 'Complete'",
+              "",
+              "## Step 5: Summary",
+              "Report: database IDs, which markets were researched, and their signals.",
+              "Tell the user: 'Review the Watchlist spreadsheet. Change Human Approval to Approved/Rejected for any market. Then tell me to proceed.'",
             ].join("\n"),
           },
         },
@@ -317,9 +433,10 @@ export function createServer(): McpServer {
               "1. Use `scan_trending_markets` to find the hottest markets",
               `2. For the top ${args.market_count} markets, use \`auto_research_market\` to generate research prompts`,
               "3. Analyze each market following the research prompt structure",
-              "4. For each market, use the Notion MCP to:",
-              "   a. Add/update a row in the Watchlist database with current prices and your signal",
-              "   b. Create a Research Report page with your full analysis",
+              "4. For each market:",
+              "   a. Use `format_watchlist_entry` to get the properties, then add to Watchlist via Notion MCP's API-post-page",
+              "   b. Create a Research Report page via API-post-page in the Research database",
+              "   c. Use `format_research_for_notion` to get beautiful block content, then write it to the page via API-patch-block-children",
               "5. At the end, give me a summary of signals:",
               "   - Which markets have edge > 5%?",
               "   - Any signal changes from previous research?",
@@ -422,10 +539,11 @@ export function createServer(): McpServer {
               "1. Use `scan_trending_markets` to find hot markets",
               `2. Pick the top ${args.market_count} by volume`,
               "3. For each, run `auto_research_market` and analyze",
-              "4. Write findings to Notion via Notion MCP:",
-              "   - Add to Watchlist with AI signal, fair value, edge",
-              "   - Set **Human Approval** = 'Pending Review'",
-              "   - Create a Research Report page with full analysis",
+              "4. Write findings to Notion:",
+              "   a. Use `format_watchlist_entry` → pass properties to Notion MCP's API-post-page (Watchlist DB)",
+              "   b. Create a Research page via API-post-page (Research DB)",
+              "   c. Use `format_research_for_notion` → pass blocks to API-patch-block-children",
+              "   - All entries will have **Human Approval** = 'Pending Review'",
               "",
               "## Phase 2: Human Review (human does this in Notion)",
               "Tell the user: 'I've written my research to Notion. Please review each market in the Watchlist:'",
@@ -450,6 +568,75 @@ export function createServer(): McpServer {
   // ═══════════════════════════════════════════════════════════════════════════
   // TOOLS — Polymarket data & research intelligence
   // ═══════════════════════════════════════════════════════════════════════════
+
+  // ─── Setup ────────────────────────────────────────────────────────────────
+
+  server.tool(
+    "setup",
+    `Set up the PolyDesk trading desk in Notion. Call this when user says "setup", "set up", "create trading desk", "initialize", or "start".
+
+This tool returns step-by-step instructions. Execute them using the Notion MCP tools (API-post-page, API-patch-block-children, etc.) and PolyDesk tools (scan_trending_markets, format_watchlist_entry).`,
+    {
+      market_count: z.number().min(1).max(20).default(10).describe("Number of trending markets to populate"),
+    },
+    async ({ market_count }) => {
+      // Fetch live trending markets
+      const markets = await getTrendingMarkets(market_count);
+      const marketSummaries = markets.map((m, i) => {
+        const outcomes = parseOutcomes(m);
+        const yp = yesPrice(m);
+        return `${i + 1}. "${truncate(m.question, 80)}" | ID: ${m.id} | Yes: ${(yp * 100).toFixed(1)}% | Vol: ${formatVolume(num(m.volume))}`;
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              "# PolyDesk Setup — Execute These Steps",
+              "",
+              "Use ENGLISH for all content. Execute each step using Notion MCP tools.",
+              "",
+              "## Step 1: Create Main Page",
+              "Use API-post-page to create a page in your workspace:",
+              "- Title: 'PolyDesk Trading Desk'",
+              "- Icon: 📊",
+              "",
+              "Then use API-patch-block-children to add:",
+              "- callout (icon: 🚀, blue_background): 'AI-powered prediction market research & trading control plane. Powered by Polymarket + Karpathy autoresearch ratchet.'",
+              "- divider",
+              "- callout (icon: 🔒, green_background): 'Human-in-the-loop: AI researches → you review → only approved trades proceed.'",
+              "- divider",
+              "",
+              "## Step 2: Create Watchlist Database",
+              "Use API-post-page with parent = the main page to create an INLINE DATABASE titled 'Market Watchlist' (icon: 👁️).",
+              "Properties (create_database is not available, so create a database via API-post-page if possible, OR create a table block):",
+              "",
+              "Use the polydesk://schemas/notion-databases resource for the full schema with these columns:",
+              "Market (title), Market ID (rich_text), Yes Price (number/percent), No Price (number/percent), Volume (number/dollar), Signal (select), Fair Value (number/percent), Edge (number/percent), Research Status (select), Human Approval (select)",
+              "",
+              "## Step 3: Populate with Live Markets",
+              `Add these ${markets.length} trending markets as rows. For each, call \`format_watchlist_entry\` with the market_id to get exact Notion properties, then use API-post-page to add the row.`,
+              "",
+              "Trending markets right now:",
+              ...marketSummaries,
+              "",
+              "## Step 4: Create Research Reports Database",
+              "Create another inline database titled 'Research Reports' (icon: 🔬) under the main page.",
+              "Use the research schema from polydesk://schemas/notion-databases.",
+              "",
+              "## Step 5: Done",
+              "Report the database IDs and tell the user:",
+              "'Your trading desk is ready! You can now:'",
+              "'- Type a keyword (like Trump, Bitcoin) in the Watchlist title column and tell me to sync'",
+              "'- Change Research Status to In Progress and tell me to sync — I will run AI research'",
+              "'- Review research reports and set Human Approval to Approved/Rejected'",
+            ].join("\n"),
+          },
+        ],
+      };
+    },
+  );
 
   // ─── Market Discovery ─────────────────────────────────────────────────────
 
@@ -666,6 +853,243 @@ export function createServer(): McpServer {
       const prompt = buildResearchPrompt(m, iteration);
       return {
         content: [{ type: "text", text: prompt }],
+      };
+    },
+  );
+
+  server.tool(
+    "research_with_ollama",
+    `One-click AI research: fetches market data, calls local Ollama LLM for analysis, and returns both the research results AND formatted Notion blocks ready to write. This is the "Research Button" — call it, then write the output to Notion.
+
+Returns:
+1. Research results (conviction, fair value, edge, evidence, risks, analysis)
+2. Notion blocks for a beautiful research report page (pass to API-patch-block-children)
+3. Watchlist properties (pass to API-post-page or API-patch-page)
+
+Requires Ollama running locally (default: http://localhost:11434).`,
+    {
+      market_id: z.string().describe("Polymarket market ID"),
+      iteration: z.number().min(1).default(1).describe("Research iteration (increment for re-research)"),
+    },
+    async ({ market_id, iteration }) => {
+      const m = await getMarketById(market_id);
+      const ollamaPrompt = buildOllamaPrompt(m, iteration);
+
+      // Call Ollama for AI research
+      const research = await callOllama(ollamaPrompt);
+
+      // Compute edge
+      const currentYesPrice = yesPrice(m);
+      const edge = research.fair_value - currentYesPrice;
+
+      const convictionEmoji: Record<string, string> = {
+        "Strong Buy": "🟢", "Buy": "🔵", "Hold": "⚪", "Sell": "🟡", "Strong Sell": "🔴",
+      };
+      const convictionColor: Record<string, string> = {
+        "Strong Buy": "green_background", "Buy": "blue_background", "Hold": "gray_background",
+        "Sell": "yellow_background", "Strong Sell": "red_background",
+      };
+
+      const outcomes = parseOutcomes(m);
+      const noPx = outcomes.find((o) => o.name.toLowerCase() === "no")?.price ?? (1 - currentYesPrice);
+
+      // Build Notion blocks for beautiful research page
+      const notionBlocks: any[] = [
+        {
+          object: "block", type: "callout",
+          callout: {
+            rich_text: [{ type: "text", text: { content: `Signal: ${research.conviction}  |  Confidence: ${research.confidence}  |  Iteration #${iteration}` }, annotations: { bold: true } }],
+            icon: { type: "emoji", emoji: convictionEmoji[research.conviction] || "📊" },
+            color: convictionColor[research.conviction] || "gray_background",
+          },
+        },
+        { object: "block", type: "divider", divider: {} },
+        {
+          object: "block", type: "heading_2",
+          heading_2: { rich_text: [{ type: "text", text: { content: "📊 Market Overview" } }] },
+        },
+        {
+          object: "block", type: "quote",
+          quote: { rich_text: [{ type: "text", text: { content: m.question }, annotations: { bold: true } }], color: "blue_background" },
+        },
+        {
+          object: "block", type: "table",
+          table: {
+            table_width: 3, has_column_header: true, has_row_header: false,
+            children: [
+              { type: "table_row", table_row: { cells: [
+                [{ type: "text", text: { content: "Outcome" }, annotations: { bold: true } }],
+                [{ type: "text", text: { content: "Price" }, annotations: { bold: true } }],
+                [{ type: "text", text: { content: "Implied Prob" }, annotations: { bold: true } }],
+              ] } },
+              ...outcomes.map((o) => ({
+                type: "table_row" as const,
+                table_row: { cells: [
+                  [{ type: "text", text: { content: o.name } }],
+                  [{ type: "text", text: { content: `$${o.price.toFixed(3)}` } }],
+                  [{ type: "text", text: { content: o.impliedProb } }],
+                ] },
+              })),
+            ],
+          },
+        },
+        {
+          object: "block", type: "paragraph",
+          paragraph: {
+            rich_text: [
+              { type: "text", text: { content: "Volume: " }, annotations: { bold: true } },
+              { type: "text", text: { content: `${formatVolume(num(m.volume))}` } },
+              { type: "text", text: { content: "  |  Liquidity: " }, annotations: { bold: true } },
+              { type: "text", text: { content: `${formatVolume(num(m.liquidity))}` } },
+              { type: "text", text: { content: "  |  Ends: " }, annotations: { bold: true } },
+              { type: "text", text: { content: `${m.endDate?.split("T")[0] ?? "N/A"}` } },
+            ],
+          },
+        },
+        { object: "block", type: "divider", divider: {} },
+        {
+          object: "block", type: "heading_2",
+          heading_2: { rich_text: [{ type: "text", text: { content: "🎯 Valuation" } }] },
+        },
+        {
+          object: "block", type: "table",
+          table: {
+            table_width: 2, has_column_header: false, has_row_header: true,
+            children: [
+              { type: "table_row", table_row: { cells: [
+                [{ type: "text", text: { content: "Market Price" }, annotations: { bold: true } }],
+                [{ type: "text", text: { content: `${(currentYesPrice * 100).toFixed(1)}%` } }],
+              ] } },
+              { type: "table_row", table_row: { cells: [
+                [{ type: "text", text: { content: "AI Fair Value" }, annotations: { bold: true } }],
+                [{ type: "text", text: { content: `${(research.fair_value * 100).toFixed(1)}%` } }],
+              ] } },
+              { type: "table_row", table_row: { cells: [
+                [{ type: "text", text: { content: "Edge" }, annotations: { bold: true } }],
+                [{ type: "text", text: { content: `${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}%` }, annotations: { bold: true, color: edge >= 0 ? "green" : "red" } }],
+              ] } },
+            ],
+          },
+        },
+        { object: "block", type: "divider", divider: {} },
+        {
+          object: "block", type: "heading_2",
+          heading_2: { rich_text: [{ type: "text", text: { content: "📈 Base Rate" } }] },
+        },
+        {
+          object: "block", type: "callout",
+          callout: {
+            rich_text: [{ type: "text", text: { content: research.base_rate || "No base rate data available." } }],
+            icon: { type: "emoji", emoji: "📉" },
+            color: "purple_background",
+          },
+        },
+        {
+          object: "block", type: "heading_2",
+          heading_2: { rich_text: [{ type: "text", text: { content: "🔍 Key Evidence" } }] },
+        },
+        ...(research.evidence || []).map((e) => ({
+          object: "block", type: "numbered_list_item",
+          numbered_list_item: { rich_text: [{ type: "text", text: { content: e } }] },
+        })),
+        { object: "block", type: "divider", divider: {} },
+        {
+          object: "block", type: "heading_2",
+          heading_2: { rich_text: [{ type: "text", text: { content: "🧠 Analysis" } }] },
+        },
+        ...(research.analysis || "").split("\n\n").filter(Boolean).map((para) => ({
+          object: "block", type: "paragraph",
+          paragraph: { rich_text: [{ type: "text", text: { content: para.trim() } }] },
+        })),
+        { object: "block", type: "divider", divider: {} },
+        {
+          object: "block", type: "heading_2",
+          heading_2: { rich_text: [{ type: "text", text: { content: "⚠️ Risks" } }] },
+        },
+        ...(research.risks || []).map((r) => ({
+          object: "block", type: "bulleted_list_item",
+          bulleted_list_item: { rich_text: [{ type: "text", text: { content: r } }], color: "red" as const },
+        })),
+        { object: "block", type: "divider", divider: {} },
+        {
+          object: "block", type: "callout",
+          callout: {
+            rich_text: [
+              { type: "text", text: { content: `Generated by PolyDesk MCP + ${OLLAMA_MODEL}  |  ` }, annotations: { italic: true } },
+              { type: "text", text: { content: new Date().toISOString().split("T")[0] }, annotations: { italic: true, code: true } },
+              { type: "text", text: { content: `  |  Iteration #${iteration}` }, annotations: { italic: true } },
+            ],
+            icon: { type: "emoji", emoji: "🤖" },
+            color: "gray_background",
+          },
+        },
+      ];
+
+      // Build watchlist properties
+      const watchlistProps: Record<string, any> = {
+        "Market": { title: [{ text: { content: truncate(m.question, 100) } }] },
+        "Market ID": { rich_text: [{ text: { content: m.id.toString() } }] },
+        "Yes Price": { number: currentYesPrice },
+        "No Price": { number: noPx },
+        "Volume": { number: num(m.volume) },
+        "Liquidity": { number: num(m.liquidity) },
+        "Signal": { select: { name: research.conviction } },
+        "Fair Value": { number: research.fair_value },
+        "Edge": { number: parseFloat(edge.toFixed(4)) },
+        "Research Status": { select: { name: "Complete" } },
+        "Human Approval": { select: { name: "Pending Review" } },
+      };
+      if (m.endDate) watchlistProps["End Date"] = { date: { start: m.endDate.split("T")[0] } };
+
+      // Research report properties
+      const researchProps: Record<string, any> = {
+        "Title": { title: [{ text: { content: `Research: ${truncate(m.question, 80)}` } }] },
+        "Market": { rich_text: [{ text: { content: truncate(m.question, 100) } }] },
+        "Market ID": { rich_text: [{ text: { content: m.id.toString() } }] },
+        "Conviction": { select: { name: research.conviction } },
+        "Fair Value": { number: research.fair_value },
+        "Market Price": { number: currentYesPrice },
+        "Edge": { number: parseFloat(edge.toFixed(4)) },
+        "Confidence": { select: { name: research.confidence } },
+        "Date": { date: { start: new Date().toISOString().split("T")[0] } },
+        "Iteration": { number: iteration },
+      };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `## 🔬 Ollama Research Complete`,
+              "",
+              `**${m.question}**`,
+              `${convictionEmoji[research.conviction] || "📊"} ${research.conviction} | Confidence: ${research.confidence}`,
+              `Fair Value: ${(research.fair_value * 100).toFixed(1)}% | Market: ${(currentYesPrice * 100).toFixed(1)}% | Edge: ${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}%`,
+              "",
+              `Model: ${OLLAMA_MODEL} | Iteration #${iteration}`,
+              "",
+              "---",
+              "",
+              "### Write to Notion",
+              "Now do these 3 steps:",
+              "",
+              "**1. Add/update Watchlist row** — API-post-page to Watchlist database:",
+              "```json",
+              JSON.stringify(watchlistProps, null, 2),
+              "```",
+              "",
+              "**2. Create Research Report page** — API-post-page to Research database:",
+              "```json",
+              JSON.stringify(researchProps, null, 2),
+              "```",
+              "",
+              "**3. Add beautiful content to the Research page** — API-patch-block-children with the research page ID:",
+              "```json",
+              JSON.stringify({ children: notionBlocks }, null, 2),
+              "```",
+            ].join("\n"),
+          },
+        ],
       };
     },
   );
@@ -1147,6 +1571,352 @@ export function createServer(): McpServer {
   );
 
   server.tool(
+    "format_research_for_notion",
+    `Generate beautiful, rich Notion page content blocks for a market research report. Returns the exact Notion API block structure — pass it directly to the Notion MCP's API-patch-block-children tool to create a stunning research page.
+
+Workflow:
+1. First create a page in your Research database using API-post-page
+2. Then call this tool to get the formatted blocks
+3. Pass the blocks to API-patch-block-children with the page ID`,
+    {
+      market_id: z.string().describe("Polymarket market ID"),
+      conviction: z.enum(["Strong Buy", "Buy", "Hold", "Sell", "Strong Sell"]).describe("Your research conviction"),
+      fair_value: z.number().min(0).max(1).describe("Your estimated fair probability (0-1)"),
+      confidence: z.enum(["High", "Medium", "Low"]).describe("Confidence level"),
+      base_rate: z.string().describe("1-2 sentences on historical base rate"),
+      evidence: z.array(z.string()).min(1).max(6).describe("Key evidence points"),
+      risks: z.array(z.string()).min(1).max(4).describe("Risk factors"),
+      analysis: z.string().describe("2-3 paragraph analysis"),
+      iteration: z.number().min(1).default(1).describe("Research iteration number"),
+    },
+    async ({ market_id, conviction, fair_value, confidence, base_rate, evidence, risks, analysis, iteration }) => {
+      const m = await getMarketById(market_id);
+      const outcomes = parseOutcomes(m);
+      const currentYesPrice = yesPrice(m);
+      const edge = fair_value - currentYesPrice;
+      const vol = num(m.volume);
+      const liq = num(m.liquidity);
+
+      const convictionColor: Record<string, string> = {
+        "Strong Buy": "green_background",
+        "Buy": "blue_background",
+        "Hold": "gray_background",
+        "Sell": "yellow_background",
+        "Strong Sell": "red_background",
+      };
+      const convictionEmoji: Record<string, string> = {
+        "Strong Buy": "🟢",
+        "Buy": "🔵",
+        "Hold": "⚪",
+        "Sell": "🟡",
+        "Strong Sell": "🔴",
+      };
+
+      // Build Notion blocks for a beautiful research page
+      const blocks: any[] = [
+        // ── Header callout with conviction
+        {
+          object: "block",
+          type: "callout",
+          callout: {
+            rich_text: [
+              { type: "text", text: { content: `Signal: ${conviction}  |  Confidence: ${confidence}  |  Iteration #${iteration}` }, annotations: { bold: true } },
+            ],
+            icon: { type: "emoji", emoji: convictionEmoji[conviction] || "📊" },
+            color: convictionColor[conviction] || "gray_background",
+          },
+        },
+        // ── Divider
+        { object: "block", type: "divider", divider: {} },
+        // ── Market Question
+        {
+          object: "block",
+          type: "heading_2",
+          heading_2: {
+            rich_text: [{ type: "text", text: { content: "📊 Market Overview" } }],
+          },
+        },
+        {
+          object: "block",
+          type: "quote",
+          quote: {
+            rich_text: [{ type: "text", text: { content: m.question }, annotations: { bold: true } }],
+            color: "blue_background",
+          },
+        },
+        // ── Outcomes table
+        {
+          object: "block",
+          type: "table",
+          table: {
+            table_width: 3,
+            has_column_header: true,
+            has_row_header: false,
+            children: [
+              {
+                type: "table_row",
+                table_row: {
+                  cells: [
+                    [{ type: "text", text: { content: "Outcome" }, annotations: { bold: true } }],
+                    [{ type: "text", text: { content: "Price" }, annotations: { bold: true } }],
+                    [{ type: "text", text: { content: "Implied Prob" }, annotations: { bold: true } }],
+                  ],
+                },
+              },
+              ...outcomes.map((o) => ({
+                type: "table_row" as const,
+                table_row: {
+                  cells: [
+                    [{ type: "text", text: { content: o.name } }],
+                    [{ type: "text", text: { content: `$${o.price.toFixed(3)}` } }],
+                    [{ type: "text", text: { content: o.impliedProb } }],
+                  ],
+                },
+              })),
+            ],
+          },
+        },
+        // ── Stats
+        {
+          object: "block",
+          type: "paragraph",
+          paragraph: {
+            rich_text: [
+              { type: "text", text: { content: "Volume: " }, annotations: { bold: true } },
+              { type: "text", text: { content: `${formatVolume(vol)}` } },
+              { type: "text", text: { content: "  |  Liquidity: " }, annotations: { bold: true } },
+              { type: "text", text: { content: `${formatVolume(liq)}` } },
+              { type: "text", text: { content: "  |  Ends: " }, annotations: { bold: true } },
+              { type: "text", text: { content: `${m.endDate?.split("T")[0] ?? "N/A"}` } },
+            ],
+          },
+        },
+        { object: "block", type: "divider", divider: {} },
+        // ── Valuation Section
+        {
+          object: "block",
+          type: "heading_2",
+          heading_2: {
+            rich_text: [{ type: "text", text: { content: "🎯 Valuation" } }],
+          },
+        },
+        {
+          object: "block",
+          type: "table",
+          table: {
+            table_width: 2,
+            has_column_header: false,
+            has_row_header: true,
+            children: [
+              {
+                type: "table_row",
+                table_row: {
+                  cells: [
+                    [{ type: "text", text: { content: "Market Price" }, annotations: { bold: true } }],
+                    [{ type: "text", text: { content: `${(currentYesPrice * 100).toFixed(1)}%` } }],
+                  ],
+                },
+              },
+              {
+                type: "table_row",
+                table_row: {
+                  cells: [
+                    [{ type: "text", text: { content: "Fair Value (AI)" }, annotations: { bold: true } }],
+                    [{ type: "text", text: { content: `${(fair_value * 100).toFixed(1)}%` } }],
+                  ],
+                },
+              },
+              {
+                type: "table_row",
+                table_row: {
+                  cells: [
+                    [{ type: "text", text: { content: "Edge" }, annotations: { bold: true } }],
+                    [{ type: "text", text: { content: `${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}%` }, annotations: { bold: true, color: edge >= 0 ? "green" : "red" } }],
+                  ],
+                },
+              },
+            ],
+          },
+        },
+        { object: "block", type: "divider", divider: {} },
+        // ── Base Rate
+        {
+          object: "block",
+          type: "heading_2",
+          heading_2: {
+            rich_text: [{ type: "text", text: { content: "📈 Base Rate Analysis" } }],
+          },
+        },
+        {
+          object: "block",
+          type: "callout",
+          callout: {
+            rich_text: [{ type: "text", text: { content: base_rate } }],
+            icon: { type: "emoji", emoji: "📉" },
+            color: "purple_background",
+          },
+        },
+        // ── Evidence
+        {
+          object: "block",
+          type: "heading_2",
+          heading_2: {
+            rich_text: [{ type: "text", text: { content: "🔍 Key Evidence" } }],
+          },
+        },
+        ...evidence.map((e, i) => ({
+          object: "block",
+          type: "numbered_list_item",
+          numbered_list_item: {
+            rich_text: [{ type: "text", text: { content: e } }],
+            color: "default",
+          },
+        })),
+        { object: "block", type: "divider", divider: {} },
+        // ── Analysis
+        {
+          object: "block",
+          type: "heading_2",
+          heading_2: {
+            rich_text: [{ type: "text", text: { content: "🧠 Analysis" } }],
+          },
+        },
+        // Split analysis into paragraphs
+        ...analysis.split("\n\n").filter(Boolean).map((para) => ({
+          object: "block",
+          type: "paragraph",
+          paragraph: {
+            rich_text: [{ type: "text", text: { content: para.trim() } }],
+          },
+        })),
+        { object: "block", type: "divider", divider: {} },
+        // ── Risks
+        {
+          object: "block",
+          type: "heading_2",
+          heading_2: {
+            rich_text: [{ type: "text", text: { content: "⚠️ Risk Factors" } }],
+          },
+        },
+        ...risks.map((r) => ({
+          object: "block",
+          type: "bulleted_list_item",
+          bulleted_list_item: {
+            rich_text: [{ type: "text", text: { content: r } }],
+            color: "red",
+          },
+        })),
+        { object: "block", type: "divider", divider: {} },
+        // ── Footer
+        {
+          object: "block",
+          type: "callout",
+          callout: {
+            rich_text: [
+              { type: "text", text: { content: `Research generated by PolyDesk MCP  |  ` }, annotations: { italic: true } },
+              { type: "text", text: { content: `${new Date().toISOString().split("T")[0]}` }, annotations: { italic: true, code: true } },
+              { type: "text", text: { content: `  |  Iteration #${iteration}  |  Autoresearch Ratchet Pattern` }, annotations: { italic: true } },
+            ],
+            icon: { type: "emoji", emoji: "🤖" },
+            color: "gray_background",
+          },
+        },
+      ];
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `## Notion Research Page Content Ready`,
+              "",
+              `Market: **${m.question}**`,
+              `Signal: ${convictionEmoji[conviction]} ${conviction} | Edge: ${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}%`,
+              "",
+              `### How to use:`,
+              `1. Create a page in your Research database with API-post-page`,
+              `2. Use API-patch-block-children with the block_id = the new page ID`,
+              `3. Pass the children array below as the body`,
+              "",
+              "### Notion Blocks (pass to API-patch-block-children):",
+              "",
+              "```json",
+              JSON.stringify({ children: blocks }, null, 2),
+              "```",
+            ].join("\n"),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "format_watchlist_entry",
+    `Generate the properties object for adding a market to the Notion Watchlist database. Returns the exact Notion API properties structure — pass it to the Notion MCP's API-post-page tool.`,
+    {
+      market_id: z.string().describe("Polymarket market ID"),
+      conviction: z.enum(["Strong Buy", "Buy", "Hold", "Sell", "Strong Sell"]).default("Hold").describe("AI signal"),
+      fair_value: z.number().min(0).max(1).optional().describe("AI estimated fair value"),
+      category: z.enum(["Politics", "Crypto", "Sports", "Science", "Culture", "Business", "Other"]).default("Other").describe("Market category"),
+    },
+    async ({ market_id, conviction, fair_value, category }) => {
+      const m = await getMarketById(market_id);
+      const outcomes = parseOutcomes(m);
+      const yesPx = yesPrice(m);
+      const noPx = outcomes.find((o) => o.name.toLowerCase() === "no")?.price ?? (1 - yesPx);
+      const edge = fair_value !== undefined ? fair_value - yesPx : undefined;
+
+      const properties: Record<string, any> = {
+        "Market": { title: [{ text: { content: truncate(m.question, 100) } }] },
+        "Market ID": { rich_text: [{ text: { content: m.id.toString() } }] },
+        "Category": { select: { name: category } },
+        "Yes Price": { number: yesPx },
+        "No Price": { number: noPx },
+        "Volume": { number: num(m.volume) },
+        "Liquidity": { number: num(m.liquidity) },
+        "Signal": { select: { name: conviction } },
+        "Research Status": { select: { name: "Complete" } },
+        "Human Approval": { select: { name: "Pending Review" } },
+      };
+
+      if (m.endDate) {
+        properties["End Date"] = { date: { start: m.endDate.split("T")[0] } };
+      }
+      if (fair_value !== undefined) {
+        properties["Fair Value"] = { number: fair_value };
+      }
+      if (edge !== undefined) {
+        properties["Edge"] = { number: parseFloat(edge.toFixed(4)) };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `## Watchlist Entry Ready`,
+              "",
+              `Market: **${m.question}**`,
+              `Signal: ${conviction} | Yes: ${(yesPx * 100).toFixed(1)}%${fair_value !== undefined ? ` | FV: ${(fair_value * 100).toFixed(1)}% | Edge: ${edge! >= 0 ? "+" : ""}${(edge! * 100).toFixed(1)}%` : ""}`,
+              "",
+              `### How to use:`,
+              `Call API-post-page with:`,
+              `- parent: { database_id: "<your watchlist database ID>" }`,
+              `- properties: (see below)`,
+              "",
+              "### Properties (pass to API-post-page):",
+              "",
+              "```json",
+              JSON.stringify(properties, null, 2),
+              "```",
+            ].join("\n"),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
     "validate_human_overrides",
     "Check if human fair value overrides are reasonable by comparing against market data and flagging potential errors. Use before executing approved trades.",
     {
@@ -1210,6 +1980,84 @@ export function createServer(): McpServer {
               "",
               "---",
               "If all checks pass, proceed with `generate_execution_plan`.",
+            ].join("\n"),
+          },
+        ],
+      };
+    },
+  );
+
+  // ─── Notion Bidirectional Sync ──────────────────────────────────────────
+
+  server.tool(
+    "sync_notion_watchlist",
+    `Bidirectional sync between Notion Watchlist and Polymarket/Ollama. Reads your Notion Watchlist database and processes changes:
+
+1. **Keyword → Market**: If a row has a keyword in the Market column but no Market ID, searches Polymarket and populates all data
+2. **Research trigger**: If Research Status = "In Progress", runs Ollama AI research and writes a beautiful report
+3. **Approval action**: If Human Approval = "Approved", generates an execution plan
+4. **Re-research**: If Human Approval = "Needs More Research", runs research again with iteration+1
+5. **Price refresh**: Updates all prices to latest
+
+Example: User types "Trump" in Notion → runs sync → system finds best matching Polymarket market and fills in all data.`,
+    {
+      watchlist_database_id: z.string().describe("Notion Watchlist database ID"),
+      research_database_id: z.string().optional().describe("Notion Research Reports database ID (for writing research pages)"),
+      run_research: z.boolean().default(true).describe("Whether to run Ollama research for 'In Progress' rows"),
+    },
+    async ({ watchlist_database_id, research_database_id, run_research }) => {
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `## Sync Notion Watchlist`,
+              "",
+              "Execute these steps using the Notion MCP:",
+              "",
+              "### Step 1: Read All Watchlist Rows",
+              `Query database \`${watchlist_database_id}\` using the Notion MCP. Read every row's properties: Market (title), Market ID, Research Status, Human Approval, Human Fair Value.`,
+              "",
+              "### Step 2: Process Each Row",
+              "",
+              "**A) Keyword → Market (rows with title but empty Market ID):**",
+              "The title column contains a search keyword (e.g., 'Trump', 'bitcoin', 'World Cup').",
+              "1. Call PolyDesk `search_markets` with that keyword",
+              "2. Pick the top result by volume",
+              "3. Call `format_watchlist_entry` with that market's ID to get Notion properties",
+              "4. Update the row via Notion MCP API-patch-page — fill in Market ID, Yes Price, No Price, Volume, Liquidity, End Date",
+              "5. Keep the title as the full market question",
+              "",
+              "**B) Research trigger (Research Status = 'In Progress'):**",
+              run_research
+                ? [
+                    "1. Call PolyDesk `research_with_ollama` with the Market ID",
+                    "2. Update the Watchlist row: Signal, Fair Value, Edge, Research Status = 'Complete'",
+                    research_database_id
+                      ? `3. Create a Research page in database \`${research_database_id}\` with the research properties from the tool output`
+                      : "",
+                    research_database_id
+                      ? "4. Write the beautiful Notion blocks to that research page via API-patch-block-children"
+                      : "",
+                  ].filter(Boolean).join("\n")
+                : "Skip (run_research = false)",
+              "",
+              "**C) Approved (Human Approval = 'Approved'):**",
+              "1. Read Human Fair Value if set, otherwise use the AI Fair Value",
+              "2. Call PolyDesk `calculate_trade` or `generate_execution_plan`",
+              "3. Report the trade plan",
+              "",
+              "**D) Needs More Research (Human Approval = 'Needs More Research'):**",
+              "1. Call `research_with_ollama` with iteration = 2",
+              "2. Update row and write new research report",
+              "3. Set Human Approval back to 'Pending Review'",
+              "",
+              "**E) All other rows with Market ID:**",
+              "1. Call PolyDesk `get_market` to refresh prices",
+              "2. Update Yes Price, No Price, Volume via API-patch-page",
+              "",
+              "### Step 3: Report",
+              "Summarize: keywords matched, markets researched, approvals processed, prices refreshed.",
             ].join("\n"),
           },
         ],
