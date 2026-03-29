@@ -676,65 +676,210 @@ export function createServer(): McpServer {
 
   server.tool(
     "setup",
-    `Set up the PolyDesk trading desk in Notion. Call this when user says "setup", "set up", "create trading desk", "initialize", or "start".
-
-This tool returns step-by-step instructions. Execute them using the Notion MCP tools (API-post-page, API-patch-block-children, etc.) and PolyDesk tools (scan_trending_markets, format_watchlist_entry).`,
+    `Set up the PolyDesk trading desk in Notion. Creates databases, populates with live Polymarket data, and starts auto-watching. Call when user says "setup", "set up", "create trading desk", or "start". Does everything directly — no extra steps needed.`,
     {
       market_count: z.number().min(1).max(20).default(10).describe("Number of trending markets to populate"),
     },
     async ({ market_count }) => {
-      // Fetch live trending markets
-      const markets = await getTrendingMarkets(market_count);
-      const marketSummaries = markets.map((m, i) => {
-        const outcomes = parseOutcomes(m);
-        const yp = yesPrice(m);
-        return `${i + 1}. "${truncate(m.question, 80)}" | ID: ${m.id} | Yes: ${(yp * 100).toFixed(1)}% | Vol: ${formatVolume(num(m.volume))}`;
+      if (!NOTION_TOKEN) {
+        return { content: [{ type: "text", text: "❌ NOTION_TOKEN not set. Add it to the polydesk MCP config." }] };
+      }
+
+      const logs: string[] = [];
+
+      // Step 1: Find a parent page (search for existing or use workspace root)
+      let parentPageId: string | undefined;
+      try {
+        const search = await notionFetch("/search", "POST", {
+          query: "PolyDesk",
+          filter: { property: "object", value: "page" },
+        });
+        parentPageId = search.results?.[0]?.id;
+      } catch {}
+
+      // Create main page
+      const mainPage = await notionFetch("/pages", "POST", {
+        parent: parentPageId
+          ? { page_id: parentPageId }
+          : { page_id: parentPageId }, // Will fail if no parent, handled below
+        properties: {
+          title: [{ text: { content: "PolyDesk Trading Desk" } }],
+        },
+        icon: { type: "emoji", emoji: "📊" },
+      }).catch(async () => {
+        // If no parent found, create in workspace by searching for any page
+        const anyPage = await notionFetch("/search", "POST", {
+          filter: { property: "object", value: "page" },
+          page_size: 1,
+        });
+        const rootId = anyPage.results?.[0]?.id;
+        if (!rootId) throw new Error("No pages found in Notion workspace");
+        return notionFetch("/pages", "POST", {
+          parent: { page_id: rootId },
+          properties: {
+            title: [{ text: { content: "PolyDesk Trading Desk" } }],
+          },
+          icon: { type: "emoji", emoji: "📊" },
+        });
       });
+      logs.push(`✅ Created main page`);
+
+      // Add intro blocks
+      await notionAppendBlocks(mainPage.id, [
+        {
+          object: "block", type: "callout",
+          callout: {
+            rich_text: [{ type: "text", text: { content: "AI-powered prediction market research & trading. Check the 🔬 Research box on any market → AI research appears automatically." }, annotations: { bold: true } }],
+            icon: { type: "emoji", emoji: "🚀" }, color: "blue_background",
+          },
+        },
+        { object: "block", type: "divider", divider: {} },
+      ]);
+
+      // Step 2: Create Watchlist database
+      const watchlistDb = await notionFetch("/databases", "POST", {
+        parent: { page_id: mainPage.id },
+        title: [{ text: { content: "Market Watchlist" } }],
+        icon: { type: "emoji", emoji: "👁️" },
+        is_inline: true,
+        properties: {
+          "Market": { title: {} },
+          "🔬 Research": { checkbox: {} },
+          "Market ID": { rich_text: {} },
+          "Yes Price": { number: { format: "percent" } },
+          "Volume": { number: { format: "dollar" } },
+          "Signal": {
+            select: {
+              options: [
+                { name: "Strong Buy", color: "green" },
+                { name: "Buy", color: "blue" },
+                { name: "Hold", color: "gray" },
+                { name: "Sell", color: "yellow" },
+                { name: "Strong Sell", color: "red" },
+                { name: "Researching", color: "purple" },
+              ],
+            },
+          },
+          "Fair Value": { number: { format: "percent" } },
+          "Edge": { number: { format: "percent" } },
+          "Research Status": {
+            select: {
+              options: [
+                { name: "Pending", color: "gray" },
+                { name: "In Progress", color: "yellow" },
+                { name: "Complete", color: "green" },
+              ],
+            },
+          },
+          "Human Approval": {
+            select: {
+              options: [
+                { name: "Pending Review", color: "yellow" },
+                { name: "Approved", color: "green" },
+                { name: "Rejected", color: "red" },
+              ],
+            },
+          },
+          "End Date": { date: {} },
+          "Liquidity": { number: { format: "dollar" } },
+          "No Price": { number: { format: "percent" } },
+        },
+      });
+      logs.push(`✅ Created Watchlist database: ${watchlistDb.id}`);
+
+      // Step 3: Create Research database
+      const researchDb = await notionFetch("/databases", "POST", {
+        parent: { page_id: mainPage.id },
+        title: [{ text: { content: "Research Reports" } }],
+        icon: { type: "emoji", emoji: "🔬" },
+        is_inline: true,
+        properties: {
+          "Title": { title: {} },
+          "Market": { rich_text: {} },
+          "Market ID": { rich_text: {} },
+          "Conviction": {
+            select: {
+              options: [
+                { name: "Strong Buy", color: "green" },
+                { name: "Buy", color: "blue" },
+                { name: "Hold", color: "gray" },
+                { name: "Sell", color: "yellow" },
+                { name: "Strong Sell", color: "red" },
+              ],
+            },
+          },
+          "Fair Value": { number: { format: "percent" } },
+          "Market Price": { number: { format: "percent" } },
+          "Edge": { number: { format: "percent" } },
+          "Confidence": {
+            select: {
+              options: [
+                { name: "High", color: "green" },
+                { name: "Medium", color: "yellow" },
+                { name: "Low", color: "red" },
+              ],
+            },
+          },
+          "Date": { date: {} },
+          "Iteration": { number: {} },
+        },
+      });
+      logs.push(`✅ Created Research database: ${researchDb.id}`);
+
+      // Step 4: Populate with live markets
+      const markets = await getTrendingMarkets(market_count);
+      let populated = 0;
+      for (const m of markets) {
+        try {
+          const outcomes = parseOutcomes(m);
+          const yp = yesPrice(m);
+          const np = outcomes.find((o) => o.name.toLowerCase() === "no")?.price ?? (1 - yp);
+          const props: Record<string, any> = {
+            "Market": { title: [{ text: { content: truncate(m.question, 100) } }] },
+            "Market ID": { rich_text: [{ text: { content: m.id.toString() } }] },
+            "🔬 Research": { checkbox: false },
+            "Yes Price": { number: yp },
+            "No Price": { number: np },
+            "Volume": { number: num(m.volume) },
+            "Liquidity": { number: num(m.liquidity) },
+            "Signal": { select: { name: "Hold" } },
+            "Research Status": { select: { name: "Pending" } },
+            "Human Approval": { select: { name: "Pending Review" } },
+          };
+          if (m.endDate) props["End Date"] = { date: { start: m.endDate.split("T")[0] } };
+          await notionCreatePage(watchlistDb.id, props);
+          populated++;
+        } catch (err) {
+          logs.push(`  ⚠️ Failed to add: ${truncate(m.question, 50)}`);
+        }
+      }
+      logs.push(`✅ Added ${populated} markets to Watchlist`);
+
+      // Step 5: Start auto-watching
+      if (watchInterval) clearInterval(watchInterval);
+      watchConfig = { watchlistDbId: watchlistDb.id, researchDbId: researchDb.id };
+      watchInterval = setInterval(async () => {
+        if (!watchConfig) return;
+        try { await processWatchlist(watchConfig.watchlistDbId, watchConfig.researchDbId); } catch {}
+      }, WATCH_INTERVAL_MS);
+      logs.push(`✅ Auto-watch started (every ${WATCH_INTERVAL_MS / 1000}s)`);
 
       return {
         content: [
           {
             type: "text",
             text: [
-              "# PolyDesk Setup — Execute These Steps",
+              "# ✅ PolyDesk Trading Desk Ready!",
               "",
-              "Use ENGLISH for all content. Execute each step using Notion MCP tools.",
+              ...logs,
               "",
-              "## Step 1: Create Main Page",
-              "Use API-post-page to create a page in your workspace:",
-              "- Title: 'PolyDesk Trading Desk'",
-              "- Icon: 📊",
+              "## How to use",
+              "1. **Check the 🔬 Research checkbox** on any market row → AI research runs automatically in ~10s",
+              "2. **Type a keyword** (Trump, Bitcoin) in a new row → market data fills in automatically",
+              "3. **Review research reports** and set Human Approval",
               "",
-              "Then use API-patch-block-children to add:",
-              "- callout (icon: 🚀, blue_background): 'AI-powered prediction market research & trading control plane. Powered by Polymarket + Karpathy autoresearch ratchet.'",
-              "- divider",
-              "- callout (icon: 🔒, green_background): 'Human-in-the-loop: AI researches → you review → only approved trades proceed.'",
-              "- divider",
-              "",
-              "## Step 2: Create Watchlist Database",
-              "Use API-post-page with parent = the main page to create an INLINE DATABASE titled 'Market Watchlist' (icon: 👁️).",
-              "Properties (create_database is not available, so create a database via API-post-page if possible, OR create a table block):",
-              "",
-              "Use the polydesk://schemas/notion-databases resource for the full schema with these columns:",
-              "Market (title), Market ID (rich_text), Yes Price (number/percent), No Price (number/percent), Volume (number/dollar), Signal (select), Fair Value (number/percent), Edge (number/percent), Research Status (select), Human Approval (select)",
-              "",
-              "## Step 3: Populate with Live Markets",
-              `Add these ${markets.length} trending markets as rows. For each, call \`format_watchlist_entry\` with the market_id to get exact Notion properties, then use API-post-page to add the row.`,
-              "",
-              "Trending markets right now:",
-              ...marketSummaries,
-              "",
-              "## Step 4: Create Research Reports Database",
-              "Create another inline database titled 'Research Reports' (icon: 🔬) under the main page.",
-              "Use the research schema from polydesk://schemas/notion-databases.",
-              "",
-              "## Step 5: Done",
-              "Report the database IDs and tell the user:",
-              "'Your trading desk is ready! You can now:'",
-              "'- Check the 🔬 Research checkbox on any market row, then tell me \"sync\" — AI research will run automatically'",
-              "'- Type a keyword (like Trump, Bitcoin) in a new row title, then \"sync\" — I will find the matching market'",
-              "'- Review research reports and set Human Approval to Approved/Rejected'",
-              "'- Tell me \"sync\" anytime to process all changes at once'",
+              `Watchlist DB: \`${watchlistDb.id}\``,
+              `Research DB: \`${researchDb.id}\``,
             ].join("\n"),
           },
         ],
