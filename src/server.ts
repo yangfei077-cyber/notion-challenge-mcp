@@ -86,6 +86,38 @@ async function notionAppendBlocks(pageId: string, children: any[]): Promise<void
 let watchInterval: ReturnType<typeof setInterval> | null = null;
 let watchConfig: { watchlistDbId: string; researchDbId?: string } | null = null;
 
+const WATCH_INTERVAL_MS = parseInt(process.env.WATCH_INTERVAL || "10") * 1000; // default 10s
+const WATCHLIST_DB_ID = process.env.WATCHLIST_DB_ID || "";
+const RESEARCH_DB_ID = process.env.RESEARCH_DB_ID || "";
+
+// Auto-discover databases by searching Notion
+async function autoDiscoverDatabases(): Promise<{ watchlistId: string; researchId?: string }> {
+  // If env vars are set, use those
+  if (WATCHLIST_DB_ID) {
+    return { watchlistId: WATCHLIST_DB_ID, researchId: RESEARCH_DB_ID || undefined };
+  }
+  // Otherwise search Notion for our databases
+  const results = await notionFetch("/search", "POST", {
+    query: "Market Watchlist",
+    filter: { property: "object", value: "database" },
+  });
+  const watchlist = results.results?.find((r: any) =>
+    r.title?.[0]?.plain_text?.includes("Watchlist") || r.title?.[0]?.plain_text?.includes("watchlist")
+  );
+  if (!watchlist) throw new Error("No Watchlist database found in Notion");
+
+  // Also look for Research Reports
+  const resResults = await notionFetch("/search", "POST", {
+    query: "Research Reports",
+    filter: { property: "object", value: "database" },
+  });
+  const research = resResults.results?.find((r: any) =>
+    r.title?.[0]?.plain_text?.includes("Research")
+  );
+
+  return { watchlistId: watchlist.id, researchId: research?.id };
+}
+
 // ─── Notion schema templates (for use with the official Notion MCP) ─────────
 
 const WATCHLIST_SCHEMA = {
@@ -2161,6 +2193,12 @@ Example: User types "Trump" in Notion → runs sync → system finds best matchi
           try {
             logs.push(`🔬 Researching: ${title}`);
 
+            // Immediately update Notion to show "Researching..." so user sees feedback
+            await notionUpdatePage(pageId, {
+              "Research Status": { select: { name: "In Progress" } },
+              "Signal": { select: { name: "Researching" } },
+            });
+
             // Call Ollama
             const m = await getMarketById(marketId);
             const ollamaPrompt = buildOllamaPrompt(m, 1);
@@ -2403,6 +2441,35 @@ Requires NOTION_TOKEN env var. Call "unwatch" to stop.`,
       return { content: [{ type: "text", text: "Not currently watching." }] };
     },
   );
+
+  // ─── Auto-start watching on server boot ──────────────────────────────────
+
+  if (NOTION_TOKEN) {
+    // Delay auto-start slightly to let the server finish connecting
+    setTimeout(async () => {
+      try {
+        const dbs = await autoDiscoverDatabases();
+        watchConfig = { watchlistDbId: dbs.watchlistId, researchDbId: dbs.researchId };
+
+        watchInterval = setInterval(async () => {
+          if (!watchConfig) return;
+          try {
+            await processWatchlist(watchConfig.watchlistDbId, watchConfig.researchDbId);
+          } catch {}
+        }, WATCH_INTERVAL_MS);
+
+        server.server.sendLoggingMessage({
+          level: "info",
+          data: `[PolyDesk] Auto-watch started (every ${WATCH_INTERVAL_MS / 1000}s). Watchlist: ${dbs.watchlistId}${dbs.researchId ? `, Research: ${dbs.researchId}` : ""}`,
+        });
+      } catch (err) {
+        server.server.sendLoggingMessage({
+          level: "warning",
+          data: `[PolyDesk] Auto-watch not started: ${err}. Use the "setup" tool first, then restart.`,
+        });
+      }
+    }, 3000);
+  }
 
   return server;
 }
